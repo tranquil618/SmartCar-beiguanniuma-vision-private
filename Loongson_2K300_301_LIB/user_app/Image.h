@@ -15,10 +15,9 @@ typedef uint8_t uint8;
 //图像规格定义
 #define IMG_W 320       //宽320
 #define IMG_H 240        //高240
-#define MAX_POINTS 180   //最大搜索点量
+#define MAX_POINTS 160   //最大搜索点量
 #define APPROX_NUM 10   //切线拟合距离
-#define MID_DIS    29.5f//中线平移距离
-#define SteerP     2.46305f //转向比例，单位为像素/度，实测值，越大表示同样的转向角度对应更大的像素偏移
+#define MID_DIS    22.5f//中线平移距离
 #define RAD_TO_DEG 57.29578f
 //有关图像边界的宏定义
 

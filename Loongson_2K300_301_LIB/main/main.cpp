@@ -1,4 +1,5 @@
 #include "main.hpp"
+#include "Drive.hpp"
 #include <signal.h> 
 #include <thread>
 #include <chrono>
@@ -18,7 +19,6 @@ std::atomic<bool> stop_flag{false};
 int run = 0;           // 1: 开始跑车
 int need_restart = 0;  // 1: 需要重启程序
 float base_speed = 0.0f;
-//uint8_t* Image_Used=nullptr;
 // 外部变量声明
 extern SpeedPID Motor_PID_L;
 extern SpeedPID Motor_PID_R;
@@ -31,6 +31,15 @@ extern int16_t bao;
 extern eular_info eulerAngle;
 extern mpu_data_t mpu_data;
 
+
+extern int start_global;
+extern int start_test; // 用于测试的全局变量，记录 start 的值
+
+
+#define COLOR_BLUE   ((lq_display_color_t)0x001F)
+#define COLOR_GREEN  ((lq_display_color_t)0x07E0)
+#define COLOR_RED    ((lq_display_color_t)0xF800)
+#define COLOR_YELLOW ((lq_display_color_t)0xFFE0)
 
 // --- 参数持久化：保存与加载 ---
 void Save_Params() {
@@ -47,11 +56,11 @@ void Save_Params() {
 }
 
 void Load_Params() {
-    ifstream inFile("params_1.txt");
+    ifstream inFile("params.txt");
     if (inFile.is_open()) {
-        float mkp,mki, akp, akd,Okp, Okd;
+        float mkp,mki, akp, akd,Okp, Okd,maxout_omega,maxout_diffspeed,K_TURN;
         int16_t goal;
-        if (inFile >> goal >> mkp >> mki >> akp >> akd >> Okp >> Okd) {
+        if (inFile >> goal >> mkp >> mki >> akp >> akd >> Okp >> Okd >> maxout_omega >> maxout_diffspeed >> K_TURN) {
             Speed_Goal = goal;
             Motor_PID_L.Kp = mkp;
             Motor_PID_R.Kp = mkp;
@@ -61,9 +70,12 @@ void Load_Params() {
             Angle_PID.Kd = akd;
             Omega_PID.Kp = Okp;
             Omega_PID.Kd = Okd;
+            Angle_PID.MaxOut = maxout_omega;
+            Omega_PID.MaxOut = maxout_diffspeed;
+            K_turn = K_TURN;
             Set_Base_Speed((float)Speed_Goal);
-            printf("[SYSTEM] 已从文件加载参数: Speed:%d,MKp:%.5f, MKi:%.5f, akp:%.5f,akd:%.5f, Okp:%.5f, Okd:%.5f\n", 
-                goal, mkp,mki,akp,akd,Okp, Okd);
+            printf("[SYSTEM] 已从文件加载参数: Speed:%d,MKp:%.5f, MKi:%.5f, akp:%.5f,akd:%.5f, Okp:%.5f, Okd:%.5f,maxomega:%.5f,maxdiffspeed:%.5f,K_turn:%.5f\n", 
+                goal, mkp,mki,akp,akd,Okp, Okd,maxout_omega,maxout_diffspeed,K_turn);
         }
         inFile.close();
     } else {
@@ -157,47 +169,34 @@ void Terminal_Debug_Menu() {
     run = prev_run; // 恢复之前的运行状态
 }
 
+void core_control_callback(void) {
+    if (!run) {
+        Motor_PID_L.Output = 0;
+        Motor_PID_R.Output = 0;
+        Left_Motor_Set_Speed(0);
+        Right_Motor_Set_Speed(0);
+        Set_Fan_Speed(0.0f, 0.0f); 
+        return; 
+    }
+    gyro_timer_callback();
+    control_callback();
+}
+
 
 // --- 主函数 ---
 int main() {
-    
-    // 硬件与信号初始化
+    // 1. 硬件与信号初始化
     Init(); 
     Image_Init();
     lq_signal_set_exit_cb(smartcar_exit_cleanup_cb);
 
-    // 3. 实例化目标检测器
-    //TargetDetector targetDetector; 
+    lq_timer core_timer;
+    core_timer.set_seconds_ms(5, core_control_callback);
 
-    //Load_Params(); 
-    lq_timer gyro_timer;    
-    if (!gyro_timer.set_seconds_ms(5, gyro_timer_callback)) {
-        cerr << "Failed to start gyro timer (10ms)" << endl;
-        return -1;
-    }
-
-    // 4. 启动控制线程
-    //std::thread angle_th(angle_control_thread);
-    //std::thread speed_th(speed_control_thread);
-
-    lq_timer control_timer;
-    if (!control_timer.set_seconds_ms(5, control_callback)) {
-        cerr << "Failed to start control timer" << endl;
-        return -1;
-    }
-
+    
     printf("\n[READY] 系统就绪。按下 KEY_2 进入调参，按下 KEY_0 发车。\n");
+    cv::Mat raw_pic,gray_pic;
     while(ls_system_running.load()) {
-        // 交互逻辑 A：KEY_2 进入终端调参
-        /*if (KEY_2.gpio_level_get() == GPIO_LOW) {
-            usleep(50000); // 消抖
-            if (KEY_2.gpio_level_get() == GPIO_LOW) {
-                Terminal_Debug_Menu();
-                while (KEY_2.gpio_level_get() == GPIO_LOW) usleep(10000);
-            }
-        }*/
-
-        // 交互逻辑 B：KEY_0 切换跑车/停止状态
         if (KEY_0.gpio_level_get() == GPIO_LOW) {
             usleep(50000);
             if (KEY_0.gpio_level_get() == GPIO_LOW) {
@@ -230,11 +229,12 @@ int main() {
             //target_detect_deal();
             //view();
         }
-        else{
+        else {
             this_thread::sleep_for(chrono::milliseconds(100));
         }
     }
     // 资源回收（实际运行中很少到达这里）
+    //targetDetector.StopThread();
     stop_flag.store(true);
     return 0;
 }

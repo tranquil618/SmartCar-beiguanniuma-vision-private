@@ -18,30 +18,39 @@ static std::atomic<float> shared_angle_output{0.0f};   // 角度环输出差速�
 
 // 外部全局变量（在 main.cpp 中定义）
 extern float base_speed;
-extern float conf_MAXL;      //左边线角点置信度，单位为0-1，越大表示越有可能是角点
-extern float conf_MAXR;      //右边线角点置信度，单位为0-1，越大表示越有可能是角点
-extern bool flag_stop;      // 用于指示是否停止识别线程
-extern bool flag;           // 用于指示是否开始识别线程
+
+//UDP发送的全局变量
 float tar_L = 0.0f;
 float tar_R = 0.0f;
-
 float speed_L=0;
 float speed_R=0;
 float dif_speed=0;
 float target_Omega=0;
-float cur_gz=0;
+float cur_Omega=0;
 float error=0;
-float dyna_speed=0;
-
+float DYNA_SPEED=0;
 int L_PWM=0;
 int R_PWM=0;
 
-//float DA1A_Dis=0;
-//float DL1A_Dis_Diff=0;
+//车辆尺寸
+// 陀螺仪 z 轴角速度 (rad/s) → 等效左右轮差速 (RPS) 的转换系数
+// 理论公式：系数 = 轮距 × 减速比 / 车轮周长
+//
+// 推导：
+//   线速度差 Δv = ω × 轮距  (mm/s)
+//   轮子 RPS 差 = Δv / 车轮周长 = ω × 轮距 / 车轮周长
+//   编码器 RPS 差 = 轮子 RPS 差 × 减速比 = ω × 轮距 × 减速比 / 车轮周长
+//
+// 参数：轮距 180mm，车轮直径 63mm，减速比 4
+//   GYRO_TO_DIFF_RPS = 180 × 4 / (63×π) ≈ 3.64
+// 请根据实际车轮间距、车轮直径和减速比标定此值
 
-#define WHEEL_DIAMETER 63.0f //车轮直径 63mm
-#define PI 3.1415926535f
-#define WHEEL_CIRCUMFERENCE (WHEEL_DIAMETER * PI) // 轮子转一圈的物理距离(约188.5mm)
+#define WHEEL_DIAMETER              63.0f //车轮直径 63mm
+#define WHEEL_CIRCUMFERENCE         (WHEEL_DIAMETER * PI) // 轮子转一圈的物理距离(约188.5mm)
+
+#define WHEEL_TRACK                 180.0f  // 轮距 (mm)
+#define GEAR_RATIO                  4.0f    // 电机减速比（编码器 RPS : 轮子 RPS）
+#define GYRO_TO_DIFF_RPS            (WHEEL_TRACK * GEAR_RATIO / WHEEL_CIRCUMFERENCE)
 
 
 static double total_distance_mm = 0.0; //里程累计变量
@@ -62,17 +71,19 @@ ls_atim_pwm Left_Motor_PWM(ATIM_PWM1_PIN82, 10000, 0);  // 左轮电机 PWM  //�
 ls_encoder_pwm Encoder_R(ENC_PWM0_PIN64, PIN_72); // 右轮编码器
 ls_encoder_pwm Encoder_L(ENC_PWM1_PIN65, PIN_73); // 左轮编码器
 
+//无刷电机部分
+// --- 定义电调的PWM频率 (手册支持 50Hz-300Hz) ---
+#define ESC_PWM_FREQ            200 
 
-#define ESC_PWM_FREQ 300
+// 占空比换算公式：1ms 对应的占空比数值 = 10 * 当前频率
+#define ESC_INIT_DUTY           (10 * ESC_PWM_FREQ)
 
-#define ESC_INIT_DUTY (10 * ESC_PWM_FREQ)
-
-// 实例化无刷电调对象 (初始状态为1ms最低油门，用于上电解锁)
+// 实例化无刷电调对象 
 ls_pwm ESC_1(PWM3_PIN89, ESC_PWM_FREQ, ESC_INIT_DUTY);           // 无刷驱动1
 ls_gtim_pwm ESC_2(GTIM_PWM3_PIN77, ESC_PWM_FREQ, ESC_INIT_DUTY); // 无刷驱动2
 
-// 全局风扇目标油门百分比 (0.0 到 100.0)
-float Fan_Speed_Target =80.0f;
+// 全局风扇目标油门百分比 
+float Fan_Speed_Target =60.0f;
 
 int ENC_Int=0;
 int ENC_Start=0;
@@ -82,6 +93,27 @@ extern lq_udp_client syd_udp;
 extern mpu_data_t mpu_data;
 extern int run;
 extern std::atomic<float> camera_error;
+float K_turn = 0.0f;
+
+/**************************************************************************
+ * 函数功能：一阶低通滤波器（基于截止频率和采样时间）
+ * 入口参数：hz   截止频率（Hz），决定滤波器允许通过的最高频率
+ *           time 采样时间间隔（秒），即函数调用周期
+ *           in   当前时刻的输入值（待滤波的原始信号）
+ *           out  指向滤波结果的指针，同时作为输入（上次滤波值）和输出（本次滤波结果）
+ * 返回  值：无
+ * 说    明：传递函数模型 G(s) = 1/(τs+1)，其中 τ = 1/(2π·hz) 为时间常数
+ *           离散化公式：y(k) = y(k-1) + α·[x(k) - y(k-1)]
+ *           α = T/(T+τ) = 1/(1 + 1/(hz·2π·T))
+ *           示例：LPF_1(20Hz, 5ms, raw_speed, &filtered_speed)
+ *                 α ≈ 0.386，即新值权重 38.6%，历史值权重 61.4%
+ **************************************************************************/
+void LPF_1(float hz, float time, float in, float *out)
+{
+    float alpha = 1.0f / (1.0f + 1.0f / (hz * 6.28f * time));
+    *out += alpha * (in - *out);
+}
+
 
 void Motor_Init(void)  //电机使能
 {
@@ -150,21 +182,34 @@ void Left_Motor_Set_Speed(int pwm) //设置左轮电机速度
 
 
 void Encoder_Speed_Get(float *Speed_L, float *Speed_R){
-    Motor_L.Encoder_Speed = - Encoder_L.encoder_get_count() ;
-    Motor_R.Encoder_Speed = Encoder_R.encoder_get_count() ;
-    *Speed_L = Motor_L.Encoder_Speed;
-    *Speed_R = Motor_R.Encoder_Speed;
+    // 读取原始转速 (RPS) 
+    // 龙邱库 encoder_get_count() 返回的是 float 类型的转速（转/秒）
+    // 左轮取反是因为左右轮物理安装方向相反
+    float raw_L = -Encoder_L.encoder_get_count();
+    float raw_R =  Encoder_R.encoder_get_count();
+    Motor_L.Encoder_Speed = raw_L;
+    Motor_R.Encoder_Speed = raw_R;
     //printf("左轮速度: %.2f  右轮速度: %.2f\n", *Speed_L, *Speed_R);
 
-   float arg_speed_rps = (Motor_L.Encoder_Speed + Motor_R.Encoder_Speed) / 2.0f;
-   float dt = 0.005f;
-   float step_distance = arg_speed_rps * WHEEL_CIRCUMFERENCE * dt;
-   total_distance_mm += step_distance;
-   total_distance_mm += step_distance;
-   ENC_Int = (int64_t)total_distance_mm;
+    // 左右轮独立速度滤波 (30Hz 截止频率, 5ms 采样周期) =====
+    // α = 1 / (1 + 1/(30 × 6.28 × 0.005)) ≈ 0.484
+    static float filter_L = 0.0f;
+    static float filter_R = 0.0f;
+    LPF_1(30.0f, 0.005f, raw_L, &filter_L);
+    LPF_1(30.0f, 0.005f, raw_R, &filter_R);
+
+    //里程累计
+    float avg_speed_rps = (filter_L + filter_R) * 0.5f;
+    float step_distance = avg_speed_rps * WHEEL_CIRCUMFERENCE * 0.005f;
+    total_distance_mm += step_distance;
+    ENC_Int = (int64_t)total_distance_mm;
+
+    *Speed_L = filter_L;
+    *Speed_R = filter_R;
+
 }
 
-void kaihuan()
+void PWM_test()
 {
     int pwm = 3000; // 设定一个较大的占空比值，测试电机响应
     Left_Motor_Set_Speed(pwm);
@@ -172,9 +217,8 @@ void kaihuan()
     float Speed_L, Speed_R;
     Encoder_Speed_Get(&Speed_L, &Speed_R);
     cout<<"pwm: "<<pwm<<endl;
-    cout<<"speed_L: "<<Speed_L<<"   speed_R: "<<Speed_R<<endl;
-    //char udp_buf[128];
     
+    //char udp_buf[128];
     //snprintf(udp_buf, sizeof(udp_buf), "%f,%f\n", (float)Speed_L, (float)Speed_R);
     //syd_udp.udp_send_string(udp_buf);
     return;
@@ -212,9 +256,11 @@ void Control_Init(float base_speed,
 void Init(){
     //lq_tft18_drv_init(0);
     Motor_Init();
-    //Control_Init(0, 0.0f,0.0f, 300.0f, 0.0f,0.0f,40.0f, 0.0f, 0.0f,6000.0f);
-    //Control_Init(0, 0.0f,0.0f, 300.0f, 0.0f,0.0f,40.0f, 0.0f, 0.0f,6000.0f);
-    Control_Init(30, 7.5f,40.0f, 300.0f, 5.2f,0.0f,40.0f, 40.0f, 4.5f,6000.0f);
+    Control_Init(
+        0.0f,                              // base_speed (由文件加载覆盖)
+        0.0f, 0.0f, 250.0f,          // 角度环: Kp,  Kd, MaxOut (°/s)
+        0.0f, 0.0f, 50.0f,   // 角速度环: Kp, Kd,  MaxOut (位置式PI)
+        0.0f, 0.0f, 8000.0f);          // 速度环: Kp, Ki, maxout
     gyro_init();
     //tof_init();
     Fan_Init();
@@ -243,125 +289,66 @@ void control_callback()
     static uint32_t tick = 0;
     tick++; // 定时器 5ms 进一次，计数加1
 
-    Set_Fan_Speed(Fan_Speed_Target, Fan_Speed_Target);
+    //Set_Fan_Speed(Fan_Speed_Target, Fan_Speed_Target);
 
 
     static float target_omega = 0.0f;
+    static float omega_correction = 0.0f;
     static float diff_speed = 0.0f;
     float current_err = camera_error.load(std::memory_order_acquire);
 
-    // 【1. 角度外环】：10ms 执行一次 
-    //if(tick % 2 == 0) {
-    float err = camera_error.load(std::memory_order_acquire); 
+    float err = current_err;
     target_omega = AnglePID_Calc(&Angle_PID, -err); 
-    //target_Omega = target_omega;
-    //}
+    target_Omega = target_omega;
     
-    // 【2. 角速度内环】：5ms 执行一次 
     float current_gz = mpu_data.gz * 57.29578f; 
-    //cur_gz = current_gz; 
-    diff_speed = OmegaPID_Calc(&Omega_PID, target_omega, current_gz);
-    //dif_speed = diff_speed;
+    cur_Omega = current_gz; 
+    //diff_speed = OmegaPID_Calc(&Omega_PID, target_omega, current_gz);
+    omega_correction = OmegaPID_Calc(&Omega_PID, target_omega, current_gz);
+    diff_speed = omega_correction*0.06353;  //speed_adj (RPS) = ω_correction(°/s) × (3.64 / 57.29578)= ω_correction(°/s) × 0.06353
+    dif_speed = diff_speed;
 
     // 【3. 动力分配与底层速度环】：5ms 执行一次
-    float raw_Speed_L, raw_Speed_R;
-    Encoder_Speed_Get(&raw_Speed_L, &raw_Speed_R);
+    float Speed_L, Speed_R;
+    Encoder_Speed_Get(&Speed_L, &Speed_R);
+    speed_L = Speed_L; 
+    speed_R = Speed_R;
 
-    static float filter_L = 0.0f;
-    static float filter_R = 0.0f;
-
-    filter_L = 0.8f * raw_Speed_L + 0.2f * filter_L;
-    filter_R = 0.8f * raw_Speed_R + 0.2f * filter_R;
-    speed_L = filter_L; 
-    speed_R = filter_R;
-
-
-    float dynamic_base_speed = base_speed; 
-    error = camera_error.load(std::memory_order_acquire);
-    //float xishu = 0.5f; // xishu 越小，外侧车轮加速越少；
-
-    float abs_diff = fabs(diff_speed);
+    float dynamic_base_speed = Get_TargetSpeed();
+    DYNA_SPEED=dynamic_base_speed;
+    //float dynamic_base_speed = 30.0f; // 使用全局基础速度作为动态基准速度
+    //cout<<"dynamic_base_speed: "<<dynamic_base_speed<<endl;
     
-    //低速识别模式
-    /*if ( fabs(abs_diff) > 5.0f) {
-        dynamic_base_speed = base_speed - (abs_diff * 0.6f); 
-        if (dynamic_base_speed < 23.0f) {
-            dynamic_base_speed =23.0f; 
-        }
-    }*/    
-    //第一跑 保底 30
+    int target_L, target_R;
+    if (diff_speed > 0) {
+        target_R = dynamic_base_speed + diff_speed * K_turn;          // R 加 diff
+        target_L = dynamic_base_speed - diff_speed * (2.0f - K_turn); // L 减 diff
+    } else {
+        target_R = dynamic_base_speed + diff_speed * (2.0f - K_turn); // R 加 diff
+        target_L = dynamic_base_speed - diff_speed * K_turn;          // L 减 diff
+    }
+
+    //float dynamic_base_speed = Get_TargetSpeed(); 
+    /*float abs_diff = fabs(diff_speed);
+
     if ( fabs(abs_diff) > 5.0f) {
         dynamic_base_speed = base_speed - (abs_diff * 0.5f); 
         if (dynamic_base_speed < 25.0f) {
             dynamic_base_speed =25.0f; 
         }
-    }
-   //speed change 1 K=0.15 0.1
-   //25 40.0 2.1 7.2 15 3.8 1.2
-
-    //中速版本 27
-    //40 40.0 2.1 9.4 15 12.8 4.2
-    /*if ( fabs(abs_diff) > 5.0f) {
-        dynamic_base_speed = base_speed - (abs_diff * 0.5f); 
-        if (dynamic_base_speed < 30.0f) {
-            dynamic_base_speed =30.0f; 
-        }
     }*/
-   //speed change 1  k=0.4 0.1
-
-   //中速版本 26
-   //电院：43 40.0 2.15 13.2 15 14.6 4.2
-   //汽院：43 40.0 2.15 13.2 15 15.8 4.2
-   //speed change 1 k=1.2 0.1
-    /*if ( fabs(abs_diff) > 5.0f) {
-        dynamic_base_speed = base_speed - (abs_diff * 0.5f); 
-        if (dynamic_base_speed < 30.0f) {
-            dynamic_base_speed =30.0f; 
-        }
-    }*/
-    
-    //高速
-
-    /*if ( fabs(abs_diff) > 5.0f) {
-        dynamic_base_speed = base_speed - (abs_diff * 0.5f); 
-        if (dynamic_base_speed < 33.0f) {
-            dynamic_base_speed =33.0f; 
-        }
-    }*/
-    dyna_speed = dynamic_base_speed;
-
-    
-    /*int target_L = 0;
-    int target_R = 0;*/
-
-    // 判断 diff_speed 的正负来决定转向方向
-    // 原逻辑：diff_speed > 0 时，左减右加 -> 左转 (左轮内侧，右轮外侧)
-    // 原逻辑：diff_speed < 0 时，左加右减 -> 右转 (右轮内侧，左轮外侧)
-   /**if (diff_speed > 0) { 
-        // 车辆左转：左轮内侧全额减速，右轮外侧微幅加速
-        target_L = dynamic_base_speed - diff_speed/**(1-xishu)*/;
-        /*target_R = dynamic_base_speed + (diff_speed * xishu);
-    } else if (diff_speed < 0) {
-        // 车辆右转：右轮内侧全额减速，左轮外侧微幅加速
-        // 注意此时 diff_speed 是负数
-        target_L = dynamic_base_speed - (diff_speed * xishu);
-        target_R = dynamic_base_speed + diff_speed/**(1-xishu)*/;
-    /*} else {
-        // 直行
-        target_L = dynamic_base_speed;
-        target_R = dynamic_base_speed;
-    }*/
+    //int target_L = dynamic_base_speed - diff_speed;
+    //int target_R = dynamic_base_speed + diff_speed;
 
 
-    int target_L = dynamic_base_speed - diff_speed;
-    int target_R = dynamic_base_speed + diff_speed;
-
-    //tar_L = target_L;
-    //tar_R = target_R;
+    // 保存到全局变量供 UDP 发送
+    tar_L = target_L;
+    tar_R = target_R;
 
 
-    int pwm_left = Left_SpeedPID(&Motor_PID_L, target_L, filter_L);
-    int pwm_right = Right_SpeedPID(&Motor_PID_R, target_R, filter_R);
+
+    int pwm_left = Left_SpeedPID(&Motor_PID_L, target_L, Speed_L);
+    int pwm_right = Right_SpeedPID(&Motor_PID_R, target_R, Speed_R);
     L_PWM = pwm_left;
     R_PWM = pwm_right;
 
@@ -375,24 +362,66 @@ void control_callback()
     Left_Motor_Set_Speed((int) pwm_left);
     Right_Motor_Set_Speed((int) pwm_right);
     
+    //UDP_data_VOFA1(); 
 
     if (tick >= 10000) tick = 0;
 }
 
-void UDP_data(void) {
-    //char udp_buf[128];
-    cout<<"speed_L: "<<speed_L<<"   speed_R: "<<speed_R<<"  target_L: "<<tar_L<<"  target_R: "<<tar_R<<endl;
-    cout<<"target_Omega: "<<target_Omega<<"  cur_gz: "<<cur_gz<<"  diff_speed: "<<dif_speed<<"  error: "<<error<<endl;
-    cout<<"L_PWM: "<<L_PWM<<"  R_PWM: "<<R_PWM<<endl;
-    //cout<<"error: "<<error<<endl;
-    cout<<"dynamic_base_speed: "<<dyna_speed<<endl;
-    //cout<<"Get_TargetSpeed(): "<<Get_TargetSpeed()<<endl;
-    //snprintf(udp_buf, sizeof(udp_buf), "%f,%f,%f\n", error, conf_MAXL*10.0, conf_MAXR*10.0);
-    //snprintf(udp_buf, sizeof(udp_buf), "%f\n", (float) error);
-    //syd_udp.udp_send_string(udp_buf);
+void UDP_data_VOFA1(void) {
+ // --- VOFA+ JustFloat 协议 (UDP单包发送) ---
+    // 14通道float32(小端序) + 4字节帧尾 = 60字节, 一次udp_send发出
+    float cam_err = camera_error.load(std::memory_order_acquire);
+
+    float vofa_buf[11];
+    vofa_buf[0]  = speed_L;
+    vofa_buf[1]  = speed_R;
+    vofa_buf[2]  = (float)tar_L;
+    vofa_buf[3]  = (float)tar_R;
+    vofa_buf[4]  = target_Omega;
+    vofa_buf[5]  = cur_Omega;
+    vofa_buf[6]  = DYNA_SPEED;
+    vofa_buf[7]  = dif_speed;
+    vofa_buf[8] = cam_err;
+    vofa_buf[9] = (float)L_PWM;
+    vofa_buf[10] = (float)R_PWM;
+
+    // 拼包: 11*4字节float数据 + 4字节帧尾, 一次性UDP发送
+    uint8_t send_buf[48];
+    memcpy(send_buf, vofa_buf, 44);  // 11 × float
+    send_buf[44] = 0x00; send_buf[45] = 0x00; // 帧尾
+    send_buf[46] = 0x80; send_buf[47] = 0x7f; // 0x7f800000
+
+    syd_udp.udp_send(send_buf, 48);
     return;
 }
 
+
+
+void UDP_data(void) {
+    // --- 纯文本 UDP 数据包 ---
+    // 发送为普通字符串，接收端直接按文本读取即可
+    float cam_err = camera_error.load(std::memory_order_acquire);
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6)
+        << speed_L << ","
+        << speed_R << ","
+        << (float)tar_L << ","
+        << (float)tar_R << ","
+        << target_Omega << ","
+        << cur_Omega << ","
+        << dif_speed << ","
+        << DYNA_SPEED << ","
+        << cam_err <<","
+        << L_PWM << ","
+        << R_PWM << "\n";
+
+        //speed_L,speed_R,tar_L,tar_R,target_Omega,cur_Omega,dif_speed,Omega_correction,camera_error,L_PWM,R_PWM
+    std::string text = oss.str();
+    syd_udp.udp_send_string(text);
+    return;
+    
+}
 
 void Enc_Start(void)
 {

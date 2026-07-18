@@ -409,7 +409,6 @@ uint8 Cross_Refind_Line(void)
     }
     
     start_test=start;//测试用，记录start的值，看看动态调整起始高度的功能是否正常
-    //cout<<Long_WhiteLine_X<<endl;
     //寻找对面赛道的黑白边界
     //先向左找左边缘
     for(int i=Long_WhiteLine_X;i>Block_Size/2+1;--i){
@@ -425,13 +424,8 @@ uint8 Cross_Refind_Line(void)
             break;
         }
     }
-    /*
-    if(x1<50||x2>270){
-        x1=160;
-        x2=160;
-    }*/
+
     start_global=start;
-    //cout<<"x1:  "<<x1<<"  x2:  "<<x2<<endl;
     //远端二次爬线与处理
     //八邻域+三角滤波+重采样插值
     Far_Left_Num=Far_Right_Num=0;

@@ -62,8 +62,8 @@ int Max_White_Height=0; //最长白列连续高度
 int Standard_Width=240; //赛道在图像底部的像素宽度(用于补线)
 int Block_Size=9;       //局部自适应窗口大小
 int Clip_Value=4;       //经验值(通常4-10)，让阈值稍微比平均亮度黑一点
-float img_k=0.999f;     //逆透视修正系数
-uint8 starty=200;        //搜索的起始y坐标
+float img_k=0.970f;     //逆透视修正系数
+uint8 starty=180;        //搜索的起始y坐标
 uint8 Find_LineNum=20;  //寻找边界的最大行数限制，防止过度所搜导致的误识别，尤其是在环岛状态下
 int Straight_TH=45;     //直线判断阈值，单位为像素，当拟合的直线与实际边界点的平均距离小于该值，则认为边界是直线
 float conf_MAXL=0;      //左边线角点置信度，单位为0-1，越大表示越有可能是角点
@@ -161,6 +161,21 @@ int left_island_flag=0;   //1表示检测到左环岛
 extern float base_speed;
 extern int run;
 extern std::atomic<float> camera_error;
+
+// ============================================================
+// 速度决策调试变量 —— 每帧更新，供 SpeedDebug_UDP() 发送
+// ============================================================
+float dbg_LongWhite     = 0;    // 白列长度
+float dbg_CamError      = 0;    // 赛道偏差 (mm)
+float dbg_LD            = 0;    // 左边线拟合残差
+float dbg_RD            = 0;    // 右边线拟合残差
+float dbg_StraightL     = 0;    // is_straightL (0/1)
+float dbg_StraightR     = 0;    // is_straightR (0/1)
+float dbg_HystCount     = 0;    // 迟滞计数器 straight_conf
+float dbg_RawSignal     = 0;    // 原始直道信号 straight_signal (0/1)
+float dbg_IsStraight    = 0;    // 迟滞确认后的弯直状态 (0/1)
+float dbg_RawTarget     = 0;    // 平滑前目标速度 Speed_Temp
+float dbg_FinalSpeed    = 0;    // 最终输出速度 smoothed_speed
 
 LP_t LeftP={L_NULL,0};     //初始化左边道路的判断
 LP_t RightP={L_NULL,0};    //初始化右边道路的判断
@@ -704,8 +719,6 @@ void track_rightline(float pts_in[][2],int start,int end,float pts_out[][2],int 
         dy*=dn;
         pts_out[i-start][0]=pts_in[i][0]+dy*Dynamic_Mid_Offset*img_k;
         pts_out[i-start][1]=pts_in[i][1]-dx*Dynamic_Mid_Offset*img_k;
-        //pts_out[i-start][0]=(Left_Line[i][0]+Right_Line[i][0])/2.0;
-        //pts_out[i-start][1]=Right_Line[i][1];
     }
 }
 //=======================================================================================================================
@@ -1183,56 +1196,206 @@ uint8 Long_White(void)
     // 返回值限制在合理高度范围内
     return (uint8)clip(y, 0, IMG_H - 1);
 }
-//=================================================================
-//加速
+
+/*
+ * ============================================================
+ *  速度决策参数（可按实际赛道在 TFT 菜单或此处调参）
+ * ============================================================
+ *  [迟滞防抖]
+ *   HYST_ENTER    直道确认帧数：连续满足直道条件多少帧后才加速（防误判）
+ *   HYST_LEAVE    弯道确认帧数：连续多少帧不满足条件才降速（越小越安全）
+ *  [弯直判断]
+ *   ERR_TH        camera_error 阈值(mm)，小于此值认为车在赛道中心
+ *   CURVE_LD_TH   拟合残差阈值：LD/RD > 此值视为弯道（越小越严格）
+ *   STRAIGHT_CONF_TH  确信直道的多重条件额外容差
+ *  [加速幅度]
+ *   SHORT_ST_TH   短直道起点（白列长度阈值，低于此值=过渡段=基准速度）
+ *   LONG_ST_TH    长直道起点（高于此值=猛加速）
+ *   MAX_WHITE     白列长度理论上限（用于归一化）
+ *   SHORT_BOOST   短直道最大提速比例（0.20=+20%）
+ *   LONG_BOOST    长直道额外提速比例（总计 SHORT_BOOST+LONG_BOOST=+50%）
+ *   CURVE_BOOST   缓弯微加速比例（曲率较小+视野好时的小幅补偿）
+ *  [平滑]
+ *   SMOOTH_ALPHA  正常速度平滑系数
+ *   FAST_ALPHA    确信直道时快速响应系数
+ * ============================================================
+ */
+#define HYST_ENTER       4       // 直道入口迟滞帧数（6帧≈30ms确认）
+#define HYST_LEAVE       2       // 直道出口迟滞帧数（3帧≈15ms降速）
+#define ERR_TH           16.0f   // 直道判定：偏差阈值 (mm) — P70≈15
+#define CURVE_LD_TH      28.0f   // 弯道拟合残差阈值（LD_P75=26，+2余量）
+#define STRAIGHT_CONF_TH 8.0f    // 确信直道：偏差多小才算"牢牢居中"
+
+#define SHORT_ST_TH      150     // 短直道起点（白列长度，130-160=缓弯）
+#define LONG_ST_TH       190     // 长直道起点（190+≈视野全开）
+#define MAX_WHITE        225     // 白列长度最大值（实测上限）
+#define SHORT_BOOST      0.15f   // 短直道最大提速 15%
+#define LONG_BOOST       0.25f   // 长直道额外提速 25%
+#define CURVE_BOOST      0.00f   // 缓弯微加速（已禁用）
+// 弯道速度控制（需求：入弯刹车 → 弯中基准 → S弯/连续弯减速 → 环岛/十字基准）
+#define CURVE_ENTRY_K     0.92f   // 入弯刹车系数（-18%）
+#define CURVE_SCURVE_K    0.96f   // 连续弯/S弯减速系数（-12%）
+#define CURVE_ENTRY_FRAMES 5      // 入弯刹车持续帧数
+#define CURVE_DURATION_TH  30     // 连续弯道超过此帧数→判定为S弯/连续弯
+#define CURVE_SCURVE_MIN   15.0f  // S弯判定：曲率下限（低于此值≈直道，不触发S弯减速）
+#define STRAIGHT_GUARD_TH  35.0f  // 直道加速的曲率安全上限（超过此值禁止加速）
+
+// 预计算倒数，用乘法替代除法（编译器常量折叠，运行时零除法开销）
+// 改动阈值时这些倒数会自动更新，无需手动重算
+#define INV_DELTA_CURVE  (1.0f / (float)(SHORT_ST_TH - 80))           // 1/70
+#define INV_DELTA_SHORT  (1.0f / (float)(LONG_ST_TH - SHORT_ST_TH))   // 1/40
+#define INV_DELTA_LONG   (1.0f / (float)(MAX_WHITE - LONG_ST_TH))     // 1/35
+
+#define SMOOTH_ALPHA     0.30f   // 加速平滑系数（慢加速，防打滑）
+#define DECEL_ALPHA      0.55f   // 减速平滑系数（快减速，防入弯推头）
+#define FAST_ALPHA       0.65f   // 确信直道快速响应系数
+
+// 速度决策内部状态（文件作用域）
+static int   g_straight_conf  = 0;      // 迟滞计数器 [-HYST_LEAVE, +HYST_ENTER]
+static float g_smoothed_speed = 0;      // 一阶低通滤波后的输出速度
+static bool  g_was_straight   = false;  // 上一帧是否在直道（用于检测入弯瞬间）
+static int   g_brake_timer    = 0;      // 入弯刹车倒计时（帧）
+static int   g_curve_duration = 0;      // 连续弯道帧数（用于 S 弯判定）
+
 void Speed_Change(void)
 {
-    if(!run)//如果确定了车停止就直接返回
+    if (!run) 
         return;
-    SpeedChangeH=SpeedChangeH%4;//循环状态机，加速阶段计数器，实现阶梯式加速
-    float Speed_Temp=base_speed;//临时初始速度变量，初始=基础速度
-    LongWhite_Speed=clip(LongWhite_Speed, 75, 100);   //限制加速出发门槛的范围，只有赛高长度大于这个值的时候才会开始加速
-    //如果白列长度够长的话，并且弯道半径足够大，路比较直时，进入提速逻辑
-    if(Long_WhiteLine > LongWhite_Speed && fabs(camera_error.load()) <5.0f){
-        //cout<<"SpeedChangeH:  "<<(int)SpeedChangeH<<endl;
-        switch(SpeedChangeH){
-            case 0:      //保持基准速度，不进行额外加速
-                Speed_Temp=base_speed;
-                break;
-            case 1:   //复合判断
-                //如果左右都是直线，按照straight_SpeedK大小比例提速
-                //否则按照WhiteLine_SpeedK小比例提速
-                if(is_straightL&&is_straightR)
-                    // 使用长度差进行加速
-                    Speed_Temp += straight_SpeedK * (Long_WhiteLine - LongWhite_Speed);
-                else
-                    Speed_Temp += WhiteLine_SpeedK * (Long_WhiteLine - LongWhite_Speed);
-                break;
-            case 2:   //纯直线提速
-                if(is_straightL&&is_straightR)
-                    Speed_Temp += straight_SpeedK * (Long_WhiteLine - LongWhite_Speed);
-                break;
-            case 3://基础线段提速，只要路够长就按照WhiteLine_SpeedK提速
-                Speed_Temp += WhiteLine_SpeedK * (Long_WhiteLine - LongWhite_Speed);
-                break;
-            default:
-                Speed_Temp=base_speed;
-                break;
+
+    if (Circle_NULL != circle_type ||
+        Ramp_NULL   != Ramp_type   ||
+        Cross_NULL  != CrossType)
+    {
+        g_straight_conf  = 0;
+        g_smoothed_speed = 0;
+        g_was_straight   = false;
+        g_brake_timer    = 0;
+        g_curve_duration = 0;
+        Set_Target_Speed(base_speed);
+        return;
+    }
+
+    float curvature = (LD > RD) ? LD : RD;  // 取更弯的一侧
+
+    float cam_err       = camera_error.load();  // 原子加载仅一次
+    bool  both_straight = (is_straightL && is_straightR);
+    bool  centered      = (fabs(cam_err) < ERR_TH);
+    bool  low_curve     = (curvature < CURVE_LD_TH);
+
+    // 基础直道信号（三个条件取与）
+    bool straight_signal = both_straight && centered && low_curve;
+
+    if (straight_signal) {
+        g_straight_conf++;
+        if (g_straight_conf > HYST_ENTER)  g_straight_conf = HYST_ENTER;
+    } 
+    else {
+        g_straight_conf--;
+        if (g_straight_conf < -HYST_LEAVE) g_straight_conf = -HYST_LEAVE;
+    }
+
+    bool is_straight = (g_straight_conf > 0);
+
+    bool confident_straight = both_straight
+                           && (fabs(cam_err) < STRAIGHT_CONF_TH)
+                           && (curvature < 1.5f)          // 铁直
+                           && (Long_WhiteLine > LONG_ST_TH + 20); // 白列远超阈值
+
+    uint8 line_len = Long_WhiteLine;
+    float Speed_Temp = base_speed;
+    float alpha = SMOOTH_ALPHA;
+
+    if (!is_straight) {
+        g_curve_duration++;
+    } 
+    else {
+        g_curve_duration = 0;
+    }
+
+    bool entering_curve = (g_was_straight && !is_straight);
+    g_was_straight = is_straight;
+
+    if (entering_curve) {
+        g_brake_timer = CURVE_ENTRY_FRAMES;
+    }
+    bool braking = (g_brake_timer > 0);
+    if (braking) 
+        g_brake_timer--;
+
+    if (!is_straight){
+        bool in_scurve = (g_curve_duration > CURVE_DURATION_TH)
+                      && (curvature >= CURVE_SCURVE_MIN);
+
+        if (braking) {
+            // 入弯刹车 → 短暂强力减速，之后恢复
+            Speed_Temp = base_speed * CURVE_ENTRY_K;
+        }
+        else if (in_scurve) {
+            // S弯/连续弯/急弯 → 持续中幅减速
+            Speed_Temp = base_speed * CURVE_SCURVE_K;
+        }
+        else {
+            // 普通弯道（刹车已结束、不够S弯门槛）→ 基准速度
+            Speed_Temp = base_speed;
         }
     }
-    else    //否则的话，保持基准速度
-        Speed_Temp=base_speed;
-    //如果遇到了坡道，速度强制降为Base_Speed-40.0f
-    if(Ramp_NULL!=Ramp_type)
-        Speed_Temp=base_speed;
-    //如果遇到了环岛，速度回归Base_Speed
-    if(Circle_NULL!=circle_type)
-        Speed_Temp=base_speed;
-    //最后通过Set_Target_Speed(Speed_Temp)将计算出的目标速度发送给底层的PID控制器进行
-    //cout<<"Speed_Temp: "<<Speed_Temp<<endl;
-    Set_Target_Speed(Speed_Temp);
-    //base_speed=Speed_Temp;  //更新基础速度为当前计算的速度，供下一次调用参考
+    else{
+        // 曲率安全阀：即使 is_straight 被误判为 true，
+        // 只要曲率超过防护阈值，就禁止加速（修复"弯道加速"bug）
+        if (curvature > STRAIGHT_GUARD_TH) {
+            Speed_Temp = base_speed;
+        }
+        else if (confident_straight){
+            // 确信直道 → 急速响应猛加速
+            float ratio = (float)(line_len - LONG_ST_TH) * INV_DELTA_LONG;
+            if (ratio > 1.0f) ratio = 1.0f;
+            Speed_Temp = base_speed * (1.0f + SHORT_BOOST + ratio * LONG_BOOST);
+            alpha = FAST_ALPHA;
+        }
+        else if (line_len < SHORT_ST_TH){
+            // 过渡段（刚出弯，白列还短）
+            Speed_Temp = base_speed;
+        }
+        else if (line_len < LONG_ST_TH){
+            // 短直道 → 微加速
+            float ratio = (float)(line_len - SHORT_ST_TH) * INV_DELTA_SHORT;
+            Speed_Temp = base_speed * (1.0f + ratio * SHORT_BOOST);
+        }
+        else{
+            // 长直道 → 猛加速
+            float ratio = (float)(line_len - LONG_ST_TH) * INV_DELTA_LONG;
+            if (ratio > 1.0f) ratio = 1.0f;
+            Speed_Temp = base_speed * (1.0f + SHORT_BOOST + ratio * LONG_BOOST);
+        }
+    }
+
+    float effective_alpha;
+    if (Speed_Temp > g_smoothed_speed) {
+        // 加速方向 → 慢加速
+        effective_alpha = alpha;  // alpha 已在上层设为 SMOOTH_ALPHA 或 FAST_ALPHA
+    } 
+    else {
+        // 减速方向 → 快减速（用 DECEL_ALPHA，比 SMOOTH_ALPHA 快一倍以上）
+        effective_alpha = DECEL_ALPHA;
+    }
+    g_smoothed_speed += effective_alpha * (Speed_Temp - g_smoothed_speed);
+    Set_Target_Speed(g_smoothed_speed);
+
+    dbg_LongWhite   = (float)Long_WhiteLine;
+    dbg_CamError    = cam_err;
+    dbg_LD          = LD;
+    dbg_RD          = RD;
+    dbg_StraightL   = is_straightL ? 1.0f : 0.0f;
+    dbg_StraightR   = is_straightR ? 1.0f : 0.0f;
+    dbg_HystCount   = (float)g_straight_conf;
+    dbg_RawSignal   = straight_signal ? 1.0f : 0.0f;
+    dbg_IsStraight  = is_straight ? 1.0f : 0.0f;
+    dbg_RawTarget   = Speed_Temp;
+    dbg_FinalSpeed  = g_smoothed_speed;
+    float dbg_BrakeTimer  = (float)g_brake_timer;
+    float dbg_CurveDuration = (float)g_curve_duration;
 }
+
 
 void banmaxian_center_scan_stop()
 {
@@ -1345,6 +1508,9 @@ int Img_Copy(void)
     if(run&&cam.get_frame_raw_gray(raw_pic,gray_pic)){
         if(!gray_pic.empty()){
             memcpy(Image_Used,gray_pic.data,IMG_H*IMG_W);
+            if(raw_pic.empty()){
+                cout<<"raw_pic.empty()!"<<endl;
+            }
             return 1;
         }
     }
@@ -1413,53 +1579,50 @@ cv::Mat show_mat;
 void view(void)
 {
     for (int y = 0; y < IMG_H; y++) {
-                uint8_t* row_ptr = ipm_pic.ptr<uint8_t>(y);
-                for (int x = 0; x < IMG_W; x++) {
-                    int src_x = (int)mapx[y][x];
-                    int src_y = (int)mapy[y][x];
-                    if (src_x >= 0 && src_x < IMG_W && src_y >= 0 && src_y < IMG_H) {
-                        row_ptr[x] = gray_pic.at<uint8_t>(src_y, src_x);
-                    }
-                    else {
-                        row_ptr[x] = 0;
-                    }      
-                }
+        uint8_t* row_ptr = ipm_pic.ptr<uint8_t>(y);
+        for (int x = 0; x < IMG_W; x++) {
+            int src_x = (int)mapx[y][x];
+            int src_y = (int)mapy[y][x];
+            if (src_x >= 0 && src_x < IMG_W && src_y >= 0 && src_y < IMG_H) {
+                row_ptr[x] = gray_pic.at<uint8_t>(src_y, src_x);
             }
-            cv::cvtColor(gray_pic,show_mat, cv::COLOR_GRAY2BGR);
-            //cv::line(show_mat,cv::Point(IMG_W/2-60,205),cv::Point(IMG_W/2+60,205),cv::Scalar(0,255,255),1);
-            //cv::line(show_mat,cv::Point(IMG_W/2-60,183),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
-            //cv::line(show_mat,cv::Point(IMG_W/2-60,205),cv::Point(IMG_W/2-60,183),cv::Scalar(0,255,255),1);
-            //cv::line(show_mat,cv::Point(IMG_W/2+60,205),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
+        }
+    }
+    cv::cvtColor(ipm_pic,show_mat, cv::COLOR_GRAY2BGR);
+    //cv::line(show_mat,cv::Point(IMG_W/2-60,205),cv::Point(IMG_W/2+60,205),cv::Scalar(0,255,255),1);
+    //cv::line(show_mat,cv::Point(IMG_W/2-60,183),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
+    //cv::line(show_mat,cv::Point(IMG_W/2-60,205),cv::Point(IMG_W/2-60,183),cv::Scalar(0,255,255),1);
+    //cv::line(show_mat,cv::Point(IMG_W/2+60,205),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
                 
-            // 5. 绘制边线和中线
-            // 5.1 绘制原有的左边线 (蓝色)
-            /*
-            for (int i = 0; i < Rep_Lnum; i++) 
-                cv::circle(show_mat, cv::Point((int)Rep_Left_Line[i][0], (int)Rep_Left_Line[i][1]), 1, cv::Scalar(255, 0, 0), -1);
-            // 5.2 绘制原有的右边线 (绿色)
-            for (int i = 0; i < Rep_Rnum; i++) 
-                cv::circle(show_mat, cv::Point((int)Rep_Right_Line[i][0], (int)Rep_Right_Line[i][1]), 1, cv::Scalar(0, 255, 0), -1);
-            // 5.1 绘制远端的左边线 (红色)
-            for (int i = 0; i < Far_Left_Num; i++) 
-                cv::circle(show_mat, cv::Point((int)FarLeft_Line[i][0], (int)FarLeft_Line[i][1]), 1, cv::Scalar(0, 0, 255), -1);
-            // 5.2 绘制远端的右边线 (黄色)
-            for (int i = 0; i < Far_Right_Num; i++) 
-                cv::circle(show_mat, cv::Point((int)FarRight_Line[i][0], (int)FarRight_Line[i][1]), 1, cv::Scalar(0, 255, 255), -1);
-            // 5.3 绘制中线 (紫色)
-            for(int i=0;i<(L_Mid_Num);i++){
-              cv::circle(show_mat,cv::Point((int)Left_Mid_Line[i][0],(int)Left_Mid_Line[i][1]),1,cv::Scalar(0, 0, 255),-1);
-            }
-            //右中线(黄色)
-            for(int i=0;i<(R_Mid_Num);i++){
-              cv::circle(show_mat,cv::Point((int)Right_Mid_Line[i][0],(int)Right_Mid_Line[i][1]),1,cv::Scalar(0, 255, 255),-1);
-            }*/
-            //中线(紫色)
-            for(int i=0;i<(*MidnumPts);i++){
-              cv::circle(show_mat,cv::Point(mapx[(int)mid_pts[i][1]][(int)mid_pts[i][0]],mapy[(int)mid_pts[i][1]][(int)mid_pts[i][0]]),1,cv::Scalar(255, 0, 255),-1);
-            }
-            //target_detect_deal();
-            // --- 6. 发送显示 ---
-            lyc_udp.udp_send_image(show_mat, 80);
+    // 5. 绘制边线和中线
+    // 5.1 绘制原有的左边线 (蓝色)
+            
+    for (int i = 0; i < Rep_Lnum; i++) 
+        cv::circle(show_mat, cv::Point((int)Rep_Left_Line[i][0], (int)Rep_Left_Line[i][1]), 1, cv::Scalar(255, 0, 0), -1);
+    // 5.2 绘制原有的右边线 (绿色)
+    for (int i = 0; i < Rep_Rnum; i++) 
+        cv::circle(show_mat, cv::Point((int)Rep_Right_Line[i][0], (int)Rep_Right_Line[i][1]), 1, cv::Scalar(0, 255, 0), -1);
+    // 5.1 绘制远端的左边线 (红色)
+    for (int i = 0; i < Far_Left_Num; i++) 
+        cv::circle(show_mat, cv::Point((int)FarLeft_Line[i][0], (int)FarLeft_Line[i][1]), 1, cv::Scalar(0, 0, 255), -1);
+    // 5.2 绘制远端的右边线 (黄色)
+    for (int i = 0; i < Far_Right_Num; i++) 
+        cv::circle(show_mat, cv::Point((int)FarRight_Line[i][0], (int)FarRight_Line[i][1]), 1, cv::Scalar(0, 255, 255), -1);
+    // 5.3 绘制中线 (紫色)
+    for(int i=0;i<(L_Mid_Num);i++){
+        cv::circle(show_mat,cv::Point((int)Left_Mid_Line[i][0],(int)Left_Mid_Line[i][1]),1,cv::Scalar(0, 0, 255),-1);
+    }
+    //右中线(黄色)
+    for(int i=0;i<(R_Mid_Num);i++){
+        cv::circle(show_mat,cv::Point((int)Right_Mid_Line[i][0],(int)Right_Mid_Line[i][1]),1,cv::Scalar(0, 255, 255),-1);
+    }
+    //中线(紫色)
+    for(int i=0;i<(*MidnumPts);i++){
+        cv::circle(show_mat,cv::Point((int)mid_pts[i][0],(int)mid_pts[i][1]),1,cv::Scalar(255, 0, 255),-1,-1);
+    }
+    //target_detect_deal();
+    // --- 6. 发送显示 ---
+    lyc_udp.udp_send_image(show_mat, 80);
 }
 
 //=================================================================
@@ -1537,7 +1700,6 @@ int mid_line_detect(void)
             //cout<<"target_trigger_y:  "<<target_trigger_y<<"Center_Line_Num"<<*Center_Line_Num<<endl;
             return 1;
         }
-
     }
     return 0;
 }
@@ -1702,9 +1864,7 @@ void getTargetType(const cv::Mat&cropped_img)
     if(cropped_img.empty()||!model_initialized_){
         return;
     }
-
     string result=ncnn_net_.Infer(cropped_img);
-
     if(result=="supplies")
         current_target=supplies;
     else if(result=="vehicle")
@@ -1713,9 +1873,55 @@ void getTargetType(const cv::Mat&cropped_img)
         current_target=weapon;
     else
         current_target=unknown;
-    
-    //cout<<"推理结果："<<result<<endl;
-        
+    cout<<"推理结果："<<result<<endl; 
+}
+
+void track_trapezoid_bypass(float pts_in[][2],int start,int end,float pts_out[][2],int *num,int trigger_)
+{
+    *num=end-start;
+
+    //定义梯形参数
+    int ramp_len=15;    //转向过程长度(梯形斜边)
+    int flat_len=20;    //保持偏移长度(梯形顶边)
+    float max_bypass=30.0f;  //避让偏移量
+
+    for(int i=start;i<end;i++){
+        int safe_trigger=clip(trigger,start+ramp_len,end-1-flat_len-ramp_len);
+        int dist=i-safe_trigger;
+        float offset_val=0.0f;
+
+        if(dist>=-ramp_len&&dist<0){
+            //上升斜坡:由0升高至max
+            offset_val=max_bypass*(float)(dist+ramp_len)/ramp_len;
+        }
+        else if(dist>=0&&dist<flat_len){
+            //平台期：保持最大偏移
+            offset_val=max_bypass;
+        }
+        else if(dist>=flat_len&&dist<flat_len+ramp_len){
+            //下降斜坡
+            offset_val=max_bypass*(1.0f-(float)(dist-flat_len)/ramp_len);
+        }
+        else{
+            offset_val=0.0f;
+        }
+
+        //应用偏移量计算
+        float total_offset=offset_val*img_k;
+        float dx=pts_in[clip(i+APPROX_NUM,0,end-1)][0]-pts_in[clip(i-APPROX_NUM,0,end-1)][0];
+        float dy=pts_in[clip(i+APPROX_NUM,0,end-1)][1]-pts_in[clip(i-APPROX_NUM,0,end-1)][1];
+        float dn=fast_invsqrt(dx*dx+dy*dy);
+        dx*=dn;
+        dy*=dn;
+        if(LRType==MID_Left){
+            pts_out[i-start][0]=pts_in[i][0]-dy*total_offset;
+            pts_out[i-start][1]=pts_in[i][1]+dx*total_offset;
+        }
+        else{
+            pts_out[i-start][0]=pts_in[i][0]+dy*total_offset;
+            pts_out[i-start][1]=pts_in[i][1]-dx*total_offset;
+        }
+    }
 }
 
 /**
@@ -1752,6 +1958,11 @@ void target_detect_deal(void)
             cv::Mat final_img = ExtractSymbolOnly_ByJump(rotated);
             cv::resize(final_img,last_cropped_img_,cv::Size(96,96));
             getTargetType(last_cropped_img_);
+
+            if(LRType==MID_Left)
+                track_trapezoid_bypass(Left_Mid_Line,0,L_Mid_Num,Left_Mid_Line,&L_Mid_Num,trigger);
+            else    
+                track_trapezoid_bypass(Right_Mid_Line,0,R_Mid_Num,Right_Mid_Line,&R_Mid_Num,trigger);
             // 一目了然：绿框是搜索范围，红线是截断位置，红点是角点
             //lyc_udp.udp_send_image(final_img, 80);
             //VisualizeDetection(show_mat, found_roi, angle,final_img.rows,rotated);
