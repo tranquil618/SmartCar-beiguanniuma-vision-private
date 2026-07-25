@@ -188,6 +188,7 @@ int main() {
     // 1. 硬件与信号初始化
     Init(); 
     Image_Init();
+
     lq_signal_set_exit_cb(smartcar_exit_cleanup_cb);
 
     lq_timer core_timer;
@@ -212,22 +213,22 @@ int main() {
         }
 
         if(Img_Copy()){
-            Img_deal();
-            //targetDetector.ExecuteSynchronousDetection(raw_pic);
+            if(!bypass_action_flag){
+                Img_deal();
+            }
             Circle_Loop();
             Cross_Loop();
-            //target_detect_deal();
+            target_detect_deal();
             //if(Left_Num==0&&Right_Num==0&&Circle_NULL==circle_type&&Cross_NULL==CrossType&&winner==3){
             //    run=0;
             //}
-            //cout<<IMG_H - Long_WhiteLine<<endl;
             //cout<<"Circle_type:  "<<circle_type<<endl;
             //cout<<"CrossType:  "<<CrossType<<endl;   
             //cout<<"LRType:  "<<LRType<<endl;
             camera_error.store(MidLine_Ctrl(), std::memory_order_release);
             //cout<<"camera_error:  "<<camera_error<<endl;
-            //target_detect_deal();
             //view();
+            //get_pic();
         }
         else {
             this_thread::sleep_for(chrono::milliseconds(100));
