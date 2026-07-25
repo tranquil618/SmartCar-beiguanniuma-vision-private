@@ -1,483 +1,763 @@
-#include "Recognition.hpp"
-#include "main.hpp"
-#include <algorithm>
-#include <iostream>
+/*
+* Recognition.cpp
+* vision part of the project
+* created by lyc on 2026/03/20
+* Copyright (c) 2026 by lyc, All Rights Reserved.
+*/
+// 必要的标准库头文件
 #include <vector>
+#include <math.h>
 #include <string>
-#include <cmath>
+#include <iostream>   // 用于cout/cerr输出
+#include <cstdint>    // 用于uint8_t
+#include <chrono>     // 用于帧率控制
+#include <thread>     // 用于延时
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/core/mat.hpp> // 显式包含cv::Mat头文件（避免未定义）
 
-using namespace std;
+#include "inc.h"
+#include "Rot.h"
+#include "Ramp.hpp"
+#include "Drive.hpp"
+#include "Image.h"
+#include "Circle.h"
+#include "Cross.h"
 
-// 初始化全局变量
-Image_Type TargetType = Image_Type::unknown;
-priority_LR Prior_LRType = priority_LR::MID_Center; // 初始化绕行优先方向为左侧
-extern int run; // 从 main.cpp 引入全局运行状态变量
-bool flag = false; // 初始化全局标志变量
-bool flag_stop=false;// 用于指示是否停止识别线程
-Image_Type winner = Image_Type::unknown; // 初始化获胜类别
-float error_offset=0.0f; // 初始化误差补偿值
+// 在 PC 上调试时，手动定义算法需要的类型，不要引用 inc.h
+#include <cstdint>
+typedef uint8_t  uint8;
+typedef uint16_t uint16;
+typedef uint32_t uint32;
+typedef uint16_t uint16_t; // 确保兼容性
 
-TargetDetector::TargetDetector() : model_initialized_(false) {
-    // 1. 初始化红色 HSV 阈值
-    lower_red1_ = cv::Scalar(0, 70, 45);
-    upper_red1_ = cv::Scalar(10, 255, 255);
-    lower_red2_ = cv::Scalar(170, 70, 45);
-    upper_red2_ = cv::Scalar(180, 255, 255);
+// 避免全局using namespace std，减少命名冲突
+using std::cout;
+using std::cerr;
+using std::endl;
+using std::vector;
+using std::string;
 
-    // 2. 初始化白色赛道 HSV 阈值
-    lower_white_ = cv::Scalar(0, 0, 160);
-    upper_white_ = cv::Scalar(180, 35, 255);
+//外部变量
+extern LQ_NCNN ncnn_net_;
+extern cv::Mat show_mat;
+extern cv::Mat raw_pic;
+extern lq_udp_client lyc_udp;
+//=================================================================
 
-    // 3. 初始化裁剪外扩比例
-    top_expand_ = 2.2;
-    side_expand_ = 0.2;
+//目标识别部分
+//记录黑白跳变发生的位置
+int target_trigger_y=-1;
+int target_trigger_x=-1;
 
-    // 4. 构造函数中提前创建形态学核（降低运行期 CPU 消耗）
-    k_white_close_ = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 7));
-    k_lane_dilate_ = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(25, 25));
-    k_red_open_    = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+cv::Mat hsv_img;   //HSV图像
+cv::Mat red_mask;  //红色mask
+cv::Mat target_crop;//裁剪结果
 
-    // 5. 初始化 NCNN 模型参数
-    std::string model_param = "tiny_classifier_fp32.ncnn.param";
-    std::string model_bin   = "tiny_classifier_fp32.ncnn.bin";
-    input_width_    = 96;
-    input_height_   = 96;
-    std::vector<std::string> labels = {"supplies", "vehicle", "weapon"};
-    float mean_vals[3] = {123.675f, 116.28f, 103.53f};
-    float norm_vals[3] = {0.01712475f, 0.017507f, 0.01742919f};
+bool target_detect_flag=false;   //当前是否进入目标检测流程
+//检测当前状态
+enum BypassState{
+    STATE_IDLE=0,         //未触发绕行，正常检测/投票
+    STATE_DECEL_VOTE,     //减速+投票
+    STATE_BYPASS_BLIND,   //切出与盲行阶段(惯导+最长白列偏航角)
+    STATE_VISION_RECOVERY //视觉找回线
+};
 
-    ncnn_net_.SetModelPath(model_param, model_bin);
-    ncnn_net_.SetInputSize(input_width_, input_height_);
-    ncnn_net_.SetLabels(labels);
-    ncnn_net_.SetNormalize(mean_vals, norm_vals);
-    /*
-    cout << "正在初始化NCNN模型..." << endl;
-    if (ncnn_net_.Init()) {
-        cout << "模型加载成功！" << endl;
-        model_initialized_ = true;
-    } else {
-        cout << "警告：模型加载失败！将无法正常识别类别。" << endl;
-    }*/
-}
-
-TargetDetector::~TargetDetector() {}
-
-
-bool TargetDetector::processFrame(cv::Mat& input_frame, const std::string& save_path) {
-    if (input_frame.empty()) {
-        return false;
-    }
-
-    // 1. 静态 ROI 裁剪（将硬裁剪由 35% 放宽至 20%，防止坡道及远端靶板被切头）
-    int roi_top = input_frame.rows*0.34f; 
-    int roi_bottom=input_frame.rows*0.10f; // 额外保留底部 5% 区域，防止近距离目标被裁掉
-    // 确保计算出的高度合法
-    int roi_height = input_frame.rows - roi_top - roi_bottom;
-
-    cv::Rect static_roi(0, roi_top, input_frame.cols, roi_height);
-    cv::Mat roi_frame = input_frame(static_roi);
-
-    // 2. 1/2 降采样提高速度（全面复用带 _ 的类成员变量）
-    double scale = 0.5; 
-    cv::resize(roi_frame, small_frame_, cv::Size(), scale, scale, cv::INTER_NEAREST);
-    cv::cvtColor(small_frame_, hsv_, cv::COLOR_BGR2HSV);
-
-    // 3. 提取白色赛道安全区
-    cv::inRange(hsv_, lower_white_, upper_white_, white_mask_);
-    cv::morphologyEx(white_mask_, white_mask_, cv::MORPH_CLOSE, k_white_close_);
-
-    std::vector<std::vector<cv::Point>> lane_contours;
-    cv::findContours(white_mask_, lane_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    
-    // 安全复用 lane_mask_ 空间
-    if (lane_mask_.size() != white_mask_.size() || lane_mask_.type() != CV_8UC1) {
-        lane_mask_ = cv::Mat::zeros(white_mask_.size(), CV_8UC1);
-    } else {
-        lane_mask_.setTo(0);
-    }
-
-    bool has_lane = false;
-    if (!lane_contours.empty()) {
-        double max_lane_area = -1;
-        int max_lane_idx = -1;
-        for (size_t i = 0; i < lane_contours.size(); ++i) {
-            double a = cv::contourArea(lane_contours[i]);
-            if (a > max_lane_area) { max_lane_area = a; max_lane_idx = i; }
-        }
-        if (max_lane_idx != -1 && max_lane_area > (hsv_.rows * hsv_.cols * 0.02)) { // 对齐 Python 2% 赛道面积基准
-            cv::drawContours(lane_mask_, lane_contours, max_lane_idx, cv::Scalar(255), -1);
-            has_lane = true;
-        }
-    }
-    
-    // 远端红条膨胀保护区
-    cv::dilate(lane_mask_, safe_lane_mask_, k_lane_dilate_);
-
-    // 4. 提取红色双段 HSV 区域
-    cv::inRange(hsv_, lower_red1_, upper_red1_, mask1_);
-    cv::inRange(hsv_, lower_red2_, upper_red2_, mask2_);
-    cv::bitwise_or(mask1_, mask2_, red_mask_);
-    cv::morphologyEx(red_mask_, red_mask_, cv::MORPH_OPEN, k_red_open_);
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(red_mask_, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    // 5. 多维智能评分系统
-    cv::Rect best_small_rect;
-    double max_score = -1.0;
-    bool found_any = false;
-
-    double min_area = 10.0;          
-    double max_area = 12500.0;
-    double aspect_ratio_min = 1.4;
-    double aspect_ratio_max = 5.0;
-    double min_fill_ratio = 0.40;
-
-    // 提前计算三角形防御所需的图像尺寸常量（基于降采样后的画布）
-    int h = hsv_.rows;
-    int w = hsv_.cols;
-    double tri_w = w * 0.30;       // 对应 Python 30% 宽
-    double tri_h = h * 0.60;       // 对应 Python 60% 高
-
-    for (const auto& cnt : contours) {
-        double area = cv::contourArea(cnt);
-        if (area < 1.0) { 
-            cv::Rect r = cv::boundingRect(cnt);
-            area = r.width * r.height;
-        }
-
-        if (area >= min_area && area < max_area) { 
-            cv::Rect rect = cv::boundingRect(cnt);
-
-            // 【吸收优点 1】等效 Python 远端两侧三角形掩码（零耗时空间解析判定）
-            int cx = rect.x + rect.width / 2;
-            int cy = rect.y + rect.height / 2;
-            
-            // 左上角三角形区域判定: y / x < (tri_h / tri_w)
-            if (cx < tri_w && cy < tri_h) {
-                if (static_cast<double>(cy) < (tri_h / tri_w) * (tri_w - cx)) {
-                    continue; // 处于左上角死角，直接剔除背景红光
-                }
-            }
-            // 右上角三角形区域判定
-            if (cx > (w - tri_w) && cy < tri_h) {
-                if (static_cast<double>(cy) < (tri_h / tri_w) * (cx - (w - tri_w))) {
-                    continue; // 处于右上角死角，直接剔除背景红光
-                }
-            }
-
-            // 阶梯式填满度约束（吸收优点 2：放宽至 0.60 提高远距离鲁棒性，防边缘畸变致使漏检）
-            double fill_ratio = area / static_cast<double>(rect.width * rect.height);
-            if (area > 50.0 && fill_ratio < 0.60) 
-                continue; 
-            if (fill_ratio < min_fill_ratio) 
-                continue;
-
-            // 位置约束与中轴线偏差
-            bool is_inside_lane = true;
-            double lane_center_dist = 0.0;
-            int center_x = std::max(0, std::min(safe_lane_mask_.cols - 1, cx));
-            int center_y = std::max(0, std::min(safe_lane_mask_.rows - 1, cy));
-
-            if (has_lane) {
-                // 高速行指针扫描
-                const uchar* row_ptr = safe_lane_mask_.ptr<uchar>(center_y);
-                if (row_ptr[center_x] != 255) is_inside_lane = false;
-
-                int left_bound = -1, right_bound = -1;
-                for (int col = 0; col < safe_lane_mask_.cols; ++col) {
-                    if (row_ptr[col] == 255) {
-                        if (left_bound == -1) left_bound = col;
-                        right_bound = col;
-                    }
-                }
-                if (left_bound != -1) {
-                    double lane_mid_x = (left_bound + right_bound) / 2.0;
-                    lane_center_dist = std::abs(center_x - lane_mid_x);
-                }
-            } else {
-                // 如果当前帧没识别到车道线，默认不进行车道线硬卡剔除，交由评分判定（增强视野丢失时的防御力）
-                is_inside_lane = true; 
-            }
-
-            // 如果当前识别到了车道线，但目标完全不在安全区内，直接过滤
-            if (has_lane && !is_inside_lane) {
-                continue;
-            }
-
-            double aspect_ratio = static_cast<double>(rect.width) / rect.height;
-            if (aspect_ratio > aspect_ratio_min && aspect_ratio < aspect_ratio_max) {
-                
-                // 复合评分机制
-                double score = area;
-                if (is_inside_lane) score += 10000.0; 
-                
-                // 【吸收优点 3】对齐 Python 严厉的长宽比偏离惩罚（惩罚系数由 20.0 提升至 100.0）
-                score -= std::abs(aspect_ratio - 2.5) * 100.0; 
-                score -= lane_center_dist * 5.0;
-
-                if (score > max_score) {
-                    max_score = score;
-                    best_small_rect = rect;
-                    found_any = true;
-                }
-            }
-        }
-    }
-
-    if (!found_any) return false;
-
-    // 6. 还原回原始坐标系
-    int orig_rect_x = best_small_rect.x / scale;
-    int orig_rect_y = (best_small_rect.y / scale) + roi_top;
-    int orig_rect_w = best_small_rect.width / scale;
-    int orig_rect_h = best_small_rect.height / scale;
-
-    // 严格双向越界安全保护
-    int y1 = std::max(0, static_cast<int>(orig_rect_y - orig_rect_h * top_expand_));
-    int y2 = std::min(input_frame.rows, static_cast<int>(orig_rect_y + orig_rect_h));
-    // 【最终化简】任它怎么粘连，底边直接锁死在红块上沿，红色绝对进不来
-    //int y1 = std::max(0, static_cast<int>(orig_rect_y - orig_rect_h * top_expand_));
-    //int y2 = std::min(input_frame.rows, static_cast<int>(orig_rect_y));
-
-    int x1 = std::max(0, static_cast<int>(orig_rect_x - orig_rect_w * side_expand_));
-    int x2 = std::min(input_frame.cols, static_cast<int>(orig_rect_x + orig_rect_w * (1.0 + side_expand_)));
-
-    int crop_w = x2 - x1;
-    int crop_h = y2 - y1;
-
-    if (crop_w > 0 && crop_h > 0) {
-        cv::Rect crop_roi(x1, y1, crop_w, crop_h);
-        cv::Mat raw_crop = input_frame(crop_roi);
-
-        // 7. 严格等比例缩放 + 居中补纯黑边扩展至标准 96x96
-        int target_size = 96;
-        double resize_scale = std::min(static_cast<double>(target_size) / raw_crop.cols, static_cast<double>(target_size) / raw_crop.rows);
-        int nw = static_cast<int>(raw_crop.cols * resize_scale);
-        int nh = static_cast<int>(raw_crop.rows * resize_scale);
-
-        cv::Mat resized_img;
-        cv::resize(raw_crop, resized_img, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
-        int top_pad    = (target_size - nh) / 2;
-        int bottom_pad = target_size - nh - top_pad;
-        int left_pad   = (target_size - nw) / 2;
-        int right_pad  = target_size - nw - left_pad;
-
-        cv::copyMakeBorder(resized_img, last_cropped_img_, top_pad, bottom_pad, left_pad, right_pad, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-        
-        if (!save_path.empty()) {
-            cv::imwrite(save_path, last_cropped_img_);
-        }
-
-        // 安全绘图反馈
-        cv::rectangle(input_frame, crop_roi, cv::Scalar(0, 255, 0), 2);
-        cv::rectangle(input_frame, cv::Rect(orig_rect_x, orig_rect_y, orig_rect_w, orig_rect_h), cv::Scalar(0, 0, 255), 2);
-        return true;
-    }
-
-    return false;
-}
-
-cv::Mat TargetDetector::getCroppedImage() const {
-    return last_cropped_img_;
-}
-
-void TargetDetector::getTargetType(const cv::Mat& cropped_img) {
-    if(cropped_img.empty() || !model_initialized_) {
-        TargetType = Image_Type::unknown;
-        return;
-    }
-
-    // 直接高速模型推理
-    string result = ncnn_net_.Infer(cropped_img);
-
-    if (result == "supplies") {
-        TargetType = Image_Type::supplies;
-    } 
-    else if (result == "vehicle") {
-        TargetType = Image_Type::vehicle;
-    } 
-    else if (result == "weapon") {
-        TargetType = Image_Type::weapon;
-    }
-    else {
-        TargetType = Image_Type::unknown;
-    }
-    cout << "推理结果: " << result << endl;
-}
+//当前状态变量(初始为IDLE)
+BypassState current_bypass_state=STATE_IDLE;
+//NCNN结果举例
+enum Image_Type{
+    unknown,
+    supplies,
+    vehicle,
+    weapon
+};
+Image_Type current_target=unknown;
 
 
-void TargetDetector::TriggerBackupStrategy(Image_Type type) 
-{
-    switch(type) {
-        case Image_Type::supplies:
-            cout << "[决策] 10帧判定为 医疗包 -> 触发向右绕行！保持 " << hold_duration_ms_ << "ms" << endl;
-            //Dynamic_Mid_Offset = 2.0f;       // 举例：强行给中线叠加向右的偏移量
-            //error_offset=5.0f;
-            current_strategy_ = StrategyState::BYPASS_RIGHT;
-            strategy_start_time_ = std::chrono::steady_clock::now();
+
+//切线斜率
+float angle;
+int trigger=-1;
+int mid_line_detect(void)
+{  
+    static int x_last=0,y_last=0;
+    static int x_last_1=0,y_last_1=0;
+    switch(LRType){
+        case MID_Left:  
+            Center_Line = Left_Mid_Line;  
+            Center_Line_Num = &L_Mid_Num;
             break;
-
-        case Image_Type::weapon:
-            cout << "[决策] 10帧判定为 武器包 -> 触发向左绕行！保持 " << hold_duration_ms_ << "ms" << endl;
-            //Dynamic_Mid_Offset = 2.0f;      // 举例：强行给中线叠加向左的偏移量
-            //error_offset=-5.0f;
-            current_strategy_ = StrategyState::BYPASS_LEFT;
-            strategy_start_time_ = std::chrono::steady_clock::now();
+        case MID_Right:
+            Center_Line = Right_Mid_Line;
+            Center_Line_Num = &R_Mid_Num;
             break;
-
-        case Image_Type::vehicle:
-            cout << "[决策] 10帧判定为 车辆 -> 维持正中行驶。" << endl;
-            //Dynamic_Mid_Offset=MID_DIS; // 直接把偏移量设置成默认的中线距离，强行回归正中
-            //error_offset=0.0f;
-            current_strategy_ = StrategyState::TRACK_MID;
-            // 车辆不需要特殊绕行，维持原有常规巡线即可
-            break;
-        case Image_Type::unknown:
-            cout << "[决策] 10帧判定为 未知 -> 维持正中行驶。" << endl;
-            Dynamic_Mid_Offset=MID_DIS; // 直接把偏移量设置成默认的中线距离，强行回归正中
-            error_offset=0.0f;
-            current_strategy_ = StrategyState::TRACK_MID;
-            // 对于未知类别，我们选择不改变当前策略，继续观察后续帧的投票结果
+        case MID_Ramp:  
+            Center_Line = RampMID;
+            Center_Line_Num = &RampMIDNum;
             break;
         default:
             break;
     }
+    if(*Center_Line_Num<5){
+        return -1;
+    }
+    for(int i=5;i<*Center_Line_Num;i++){
+        int x=mapx[(int)Center_Line[i][1]][(int)Center_Line[i][0]];
+        int y=mapy[(int)Center_Line[i][1]][(int)Center_Line[i][0]];
+
+        if(AT(x,y)>OSTU_threshold){
+            x_last_1=x_last;
+            y_last_1=y_last;
+            x_last=x;
+            y_last=y;
+            continue;
+        }
+
+        if(AT(x,y)<OSTU_threshold&&AT(x_last,y_last)>OSTU_threshold&&AT(x_last_1,y_last_1)>OSTU_threshold){
+            target_trigger_x=x;
+            target_trigger_y=y;
+            trigger=i;
+            //cout<<trigger<<endl;
+            //cout<<"target_trigger_y:  "<<target_trigger_y<<"Center_Line_Num"<<*Center_Line_Num<<endl;
+            return 1;
+        }
+    }
+    return 0;
 }
 
-void TargetDetector::UpdateStrategyStatus() 
+//初始化红色HSV阈值
+const cv::Scalar lower_red1_ = cv::Scalar(0, 70, 45);
+const cv::Scalar upper_red1_ = cv::Scalar(10, 255, 255);
+const cv::Scalar lower_red2_ = cv::Scalar(170, 70, 45);
+const cv::Scalar upper_red2_ = cv::Scalar(180, 255, 255);
+
+// 初始化白色赛道 HSV 阈值
+const cv::Scalar lower_white_ = cv::Scalar(0, 0, 160);
+const cv::Scalar upper_white_ = cv::Scalar(180, 35, 255);
+cv::Mat mask1_, mask2_, red_mask_, last_cropped_img_;
+
+//专门提取红块掩码
+void get_red_mask(cv::Mat&hsv_input,cv::Mat& output_mask)
 {
-    if (current_strategy_ == StrategyState::TRACK_MID) {
-        return; // 处于普通巡线状态，无需处理超时
+    //提取红色的第一个色段
+    cv::inRange(hsv_input,lower_red1_,upper_red1_,mask1_);
+    //提取红色的第二个色段
+    cv::inRange(hsv_input,lower_red2_,upper_red2_,mask2_);
+    //将两个掩码进行逻辑或运算，合并成一个完整的红色区域图
+    cv::bitwise_or(mask1_,mask2_,output_mask);
+}
+
+cv::RotatedRect current_rRect;
+cv::RotatedRect final_refind_rRect;
+float zoom=0.25f;
+
+cv::Rect QuickDetect(int center_x,int center_y,const cv::Mat&hsv_img)
+{
+    //算切向角
+    int y_idx=trigger;
+    //取目标点上下附近的点来求导，计算赛道切线方向
+    int y_upper=std::max(10,std::min(y_idx+10,*Center_Line_Num-1));
+    int y_lower=std::max(10,std::min(y_idx,*Center_Line_Num-1));
+    //dx，dy是切线的偏移量，atan2计算弧度，乘上RAD_TO_DEG转为角度
+    float dx=Center_Line[y_upper][0]-Center_Line[y_lower][0];
+    float dy=Center_Line[y_upper][1]-Center_Line[y_lower][1];
+    //cout<<dx<<"    "<<dy<<endl;
+    float rad=atan2(dy,dx);
+    angle=rad*RAD_TO_DEG;
+    
+    cv::Size2f rSize(60.0f-zoom*y_idx, 45.0f-zoom*y_idx); 
+    
+    // 创建 RotatedRect，注意：此时 center 是中心点
+    // 如果 trigger 是底边中点，那么中心点需要向上平移 height/2
+    float height = rSize.height;
+    float center_offset_x = (height / 2.0f) * cos(rad);
+    float center_offset_y = -(height / 2.0f) * sin(rad);
+    
+    cv::Point2f center_point(center_x + center_offset_x, center_y - center_offset_y);
+    current_rRect = cv::RotatedRect(center_point, rSize, angle);
+
+    // 3. 利用 boundingRect 获得绝对安全的轴对齐矩形 (不会掉信息！)
+    cv::Rect safe_roi = current_rRect.boundingRect();
+    
+    // 4. 修正边界，防止越界
+    safe_roi &= cv::Rect(0, 0, hsv_img.cols, hsv_img.rows);
+
+    // 5. 裁剪并验证
+    cv::Mat hocal_bgr=hsv_img(safe_roi);
+    cv::Mat local_hsv;
+    cv::cvtColor(hocal_bgr,local_hsv,cv::COLOR_BGR2HSV);
+    cv::Mat local_mask;
+    get_red_mask(local_hsv, local_mask);
+    
+    int red_pixels = cv::countNonZero(local_mask);
+    int total_pixels = local_mask.rows * local_mask.cols;
+    
+    if(total_pixels > 0 && (float)red_pixels > total_pixels * 0.05 && (float)red_pixels < total_pixels * 0.85){
+        return safe_roi;
+    }
+    return cv::Rect(0,0,0,0);
+}
+
+cv::Mat CropAndPerspective(const cv::Mat& src, cv::RotatedRect rRect, int y_idx)
+{
+    // 1. 获取 RotatedRect 的四个顶点
+    cv::Point2f src_pts[4];
+    rRect.points(src_pts);
+
+    // 2. 动态计算目标画布大小 (依据距离远近自适应分辨率)
+    // 基础尺寸：你可以设定一个标准的期望输出大小，例如期望统一归一化到 128x128 或者是根据物理长宽动态缩放
+    float base_w = rRect.size.width;
+    float base_h = rRect.size.height;
+
+    // 引入距离因子：y_idx 越大代表距离越近（假设你的坐标系里y往下是增大）
+    // 或者用 rRect 的实际高度在图像中所占的像素来决定输出画布大小
+    float scale_factor = 1.0f;
+    
+    // 示例：如果目标在远处（rRect 像素较小），我们适当放大输出画布上限；
+    // 如果目标在近处，限制最大输出尺寸，避免过采样消耗算力。
+    float current_diagonal = std::hypot(base_w, base_h);
+    
+    // 设定一个固定的理想网络输入像素尺度（比如 NCNN 模型如果最终要缩放到 96x96，
+    // 我们可以让透视变换直接输出一个适中的清晰尺寸，如 128x128，再给模型缩放）
+    int target_size = 256; 
+
+    cv::Point2f dst_pts[4] = {              
+        cv::Point2f(target_size, target_size),   // 右下
+        cv::Point2f(0, target_size),             // 左下        
+        cv::Point2f(0, 0),                       // 左上
+        cv::Point2f(target_size, 0)              // 右上
+    };
+
+    // 3. 计算透视变换矩阵
+    cv::Mat trans_mat=cv::getPerspectiveTransform(src_pts, dst_pts);
+
+    // 4. 执行透视变换（输出统一大小的清晰图，方便后续神经网络提取特征）
+    cv::Mat rotated_crop;
+    cv::warpPerspective(src,rotated_crop,trans_mat,cv::Size(target_size,target_size),cv::INTER_AREA); 
+    // 注意：缩小或变换时用 cv::INTER_AREA 插值效果最好，能保留更多纹理细节，抗锯齿。
+
+    return rotated_crop;
+}
+
+cv::Mat RemoveRedBaseSafely(const cv::Mat& rotated_crop)
+{
+    if(rotated_crop.empty())
+        return rotated_crop;
+
+    // 1. 克隆原图：坚持“非破坏性处理”
+    cv::Mat result = rotated_crop.clone();
+    cv::Vec3b track_bg_color(255, 255, 255);
+    // ==================== 优化点：横扫前十行，寻找最亮的像素取平均作为背景色 ====================
+    int scan_rows = std::min(10, rotated_crop.rows);
+    std::vector<cv::Vec3b> top_pixels;
+    
+    for(int r=0;r<scan_rows;++r) {
+        for(int c=0;c<rotated_crop.cols;++c) {
+            top_pixels.push_back(rotated_crop.at<cv::Vec3b>(r,c));
+        }
     }
 
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - strategy_start_time_).count();
+    // 按照亮度 (B+G+R 的和) 从大到小排序，选出最亮的前 10% 像素点取平均
+    if (!top_pixels.empty()) {
+        std::sort(top_pixels.begin(),top_pixels.end(),[](const cv::Vec3b& a,const cv::Vec3b& b) {
+            return (int)a[0]+a[1]+a[2]>(int)b[0]+b[1]+b[2];
+        });
 
-    if (elapsed >= hold_duration_ms_) {
-        cout << "[状态机] ⏳ 绕行时间已满，平滑回归常规中线行驶。" << endl;
+        int take_count=std::max(1,(int)(top_pixels.size()*0.1)); // 取最亮的前 10%
+        long long sum_b=0,sum_g=0,sum_r=0;
+        for(int i=0;i<take_count;++i) {
+            sum_b+=top_pixels[i][0];
+            sum_g+=top_pixels[i][1];
+            sum_r+=top_pixels[i][2];
+        }
         
-        // 恢复你的常规巡线控制变量
-        //Track_Choose(); // 假设你有默认正常状态，请根据实际业务修改
-        Dynamic_Mid_Offset = MID_DIS; // 恢复默认中线偏移量
-        error_offset=0.0f;
-        flag_stop = false; // 重置全局标志位，准备下一轮识别
-        winner = Image_Type::unknown; // 重置投票结果
-        current_strategy_ = StrategyState::TRACK_MID;
+        track_bg_color=cv::Vec3b(sum_b/take_count,sum_g/take_count,sum_r/take_count);
     }
-}
-
-
-// ================= 单线程串行集成调用函数 =================
-void TargetDetector::ExecuteSynchronousDetection(const cv::Mat& current_frame) 
-{
-    // 1. 如果小车没有处于运行状态，直接跳过
-    // (请确保 run 变量在作用域内可访问，如果是全局变量建议加上 extern 或改为类成员)
-    if (!run) {
-        return;
-    }
-    // 2. 状态机管理：如果当前正在执行绕行，判断是否超时
-    UpdateStrategyStatus();
-    if (current_strategy_ == StrategyState::BYPASS_RIGHT || current_strategy_ == StrategyState::BYPASS_LEFT) {
-        return; 
-    }
-    // 3. 只有在常规巡线状态下，才去探索新目标（防止绕行中途被误检覆盖）
-    if (current_strategy_ != StrategyState::TRACK_MID) {
-        return; 
-    }
-    if (current_frame.empty()) {
-        return;
-    }
-    // 【优化点】：因为 processFrame 内部要安全绘图并提交上位机显示，
-    // 我们在此处传入非 const 的可变矩阵。如果后续主流程还要用原图，可以用 clone()
-    cv::Mat editable_frame = current_frame.clone();
-    // 4. 【前置哨兵】先通过传统视觉算法寻找红色靶板区域并裁剪
-    flag = processFrame(editable_frame, "1.jpg"); 
-    Image_Type current_frame_type = Image_Type::unknown;
-    if (flag) {
-        // 找到了目标！此时才触发高负载的 NCNN 模型推理
-        getTargetType(last_cropped_img_);
-        current_frame_type = TargetType; // 获取推理出的类别 (supplies / weapon / vehicle)
-    } 
     else {
-        // 没找到红色靶板，当前帧视为 unknown
-        current_frame_type = Image_Type::unknown;
+        // 兜底退路
+        track_bg_color=rotated_crop.at<cv::Vec3b>(2,rotated_crop.cols/2);
     }
-    // 5. 将当前帧结果压入滑动窗口队列进行滤波
-    frame_window_.push_back(current_frame_type);
-    // 保持 5 帧滑动窗口大小
-    if (frame_window_.size() > 3) {
-        frame_window_.erase(frame_window_.begin());
-    }
-    /*
-    // 当攒满 5 帧数据时进行安全投票判定
-    if (frame_window_.size() == 5) {
-        std::map<Image_Type, int> vote_map;
-        for (auto t : frame_window_) {
-            vote_map[t]++;
+    // ====================================================================================
+
+    // 获取 HSV 红色掩码
+    cv::Mat hsv,red_mask;
+    cv::cvtColor(rotated_crop,hsv,cv::COLOR_BGR2HSV);
+    get_red_mask(hsv,red_mask);
+
+    // 3. 形态学闭运算与膨胀
+    cv::Mat kernel=cv::getStructuringElement(cv::MORPH_RECT,cv::Size(3,3));
+    cv::morphologyEx(red_mask,red_mask,cv::MORPH_CLOSE,kernel);
+
+    cv::Mat dilate_kernel=cv::getStructuringElement(cv::MORPH_RECT,cv::Size(5,5));
+    cv::dilate(red_mask,red_mask,dilate_kernel);
+
+    // 4. 连通域分析
+    cv::Mat labels, stats, centroids;
+    int num_labels=cv::connectedComponentsWithStats(red_mask,labels,stats,centroids,8);
+
+    int safety_line = static_cast<int>(rotated_crop.rows * 0.45);
+
+    for(int i = 1; i < num_labels; ++i) {
+        int x = stats.at<int>(i, cv::CC_STAT_LEFT);
+        int y = stats.at<int>(i, cv::CC_STAT_TOP);
+        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        int area = stats.at<int>(i, cv::CC_STAT_AREA);
+
+        // 空间硬隔离
+        if(y < safety_line) {
+            continue; 
         }
 
-        // 寻找得票最高的类别
-        int max_votes = 0;
-        Image_Type local_winner = Image_Type::unknown;
-        
-        for (auto const& [type, count] : vote_map) {
-            if (count > max_votes) {
-                max_votes = count;
-                local_winner = type;
+        bool touches_bottom = (y + h > rotated_crop.rows * 0.75);
+
+        // 提取当前连通域坐标以计算最小外接矩形
+        std::vector<cv::Point> pts;
+        for(int r = y; r < y + h; ++r) {
+            for(int c = x; c < x + w; ++c) {
+                if(r >= 0 && r < labels.rows && c >= 0 && c < labels.cols) {
+                    if(labels.at<int>(r, c) == i) {
+                        pts.push_back(cv::Point(c, r));
+                    }
+                }
             }
         }
 
-        // 设定决定性阈值：5 帧中某一特定有效类别必须达到 3 帧以上才触发
-        if (max_votes >= 3 && local_winner != Image_Type::unknown) {
-            winner = local_winner;                 // 更新全局投票结果
-            flag_stop = true;                      // 设置全局标志位通知主线程停止当前识别循环
-            TriggerBackupStrategy(local_winner);   // 根据投票结果触发对应的绕行策略
-            frame_window_.clear();                 // 触发成功后清空窗口，为下一次巡线做准备
-            return;
-        } 
-        // 【新增防御逻辑】：如果最高票是 unknown 且过半数，说明视野里确实没靶板
-        // 及时清空窗口，防止历史残余的个别误检噪点在窗口中“借尸还魂”累计激发现象
-        else if (local_winner == Image_Type::unknown && max_votes >= 3) {
-            frame_window_.clear();
-        }
-    }*/
-    // 当攒满 5 帧数据时进行【加权】投票判定
-    if (frame_window_.size() == 3) {
-        // 使用 double 或 int 存储每个类别的累计权重得分
-        std::map<Image_Type, int> weight_vote_map;
-        
-        // 定义权重模板，索引越靠后（最新、最近），权重越大
-        const std::vector<int> weights = {/*1, 1, 1, 1,*/ 1, 1, 1/*, 2, 3, 4*/}; // 10帧窗口，前6帧权重1，后4帧权重递增到4（最新一帧权重最高）
+        if(pts.empty()) continue;
 
-        // 1. 加权统计
-        for (size_t i = 0; i < frame_window_.size(); ++i) {
-            Image_Type t = frame_window_[i];
-            weight_vote_map[t] += weights[i]; // 不再是++，而是加上对应的权重
-        }
-
-        // 2. 寻找权重得分最高的类别
-        int max_weight_scores = 0;
-        Image_Type local_winner = Image_Type::unknown;
+        cv::RotatedRect min_rect = cv::minAreaRect(pts);
+        float rect_w = min_rect.size.width;
+        float rect_h = min_rect.size.height;
         
-        for (auto const& [type, score] : weight_vote_map) {
-            if (score > max_weight_scores) {
-                max_weight_scores = score;
-                local_winner = type;
+        float long_side = std::max(rect_w, rect_h);
+        float short_side = std::min(rect_w, rect_h);
+        float true_ratio = (short_side > 0) ? (long_side / short_side) : 0.0f;
+
+        bool is_bottom_base = (true_ratio > 1.5f && touches_bottom);
+
+        if(is_bottom_base) {
+            // 精准抹除底座像素
+            for(int r = y; r < y + h; ++r) {
+                for(int c = x; c < x + w; ++c) {
+                    if(r >= 0 && r < result.rows && c >= 0 && c < result.cols) {
+                        if(labels.at<int>(r, c) == i) {
+                            result.at<cv::Vec3b>(r, c) = track_bg_color;
+                        }
+                    }
+                }
             }
         }
+    }
+    return result;
+}
 
-        // 3. 设定决定性权重阈值（总分8分，达到5分及以上触发，且胜者不能是 unknown）
-        if (max_weight_scores >= 2 && local_winner != Image_Type::unknown) {
-            winner = local_winner; 
-            flag_stop = true;                      
-            TriggerBackupStrategy(local_winner);   
-            frame_window_.clear();                 
-            return;
-        } 
-        // 防御逻辑：如果最高分是 unknown 且占绝对优势（比如 >= 5分），及时清空窗口
-        else if (local_winner == Image_Type::unknown && max_weight_scores >= 2) {
-            frame_window_.clear();
+
+
+/**
+ * @param img           要绘制的底图 (建议传 raw_pic)
+ * @param roi           QuickDetect 得到的原始矩形
+ * @param angle         切线角
+ * @param bottom_edge   ExtractSymbolOnly_ByJump 得到的截断位置 (相对坐标)
+ * @param rotated_img   ExtractSymbolOnly_ByJump 之后的那张摆正后的图 (用于画局部截断线)
+ */
+void VisualizeDetection(cv::Mat& img, cv::Rect roi, float angle, int bottom_edge, cv::Mat& rotated_img)
+{
+    // 直接获取 RotatedRect 的四个顶点
+    cv::Point2f vertices[4];
+    current_rRect.points(vertices);
+    
+    // 绘制绿色的斜框
+    for (int i = 0; i < 4; i++) {
+        cv::line(img, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
+        cv::circle(img, vertices[i], 5, cv::Scalar(0, 0, 255), -1);
+    }
+
+    // --- 第二部分：在摆正后的局部图中绘制红色截断线 ---
+    // 这行线清晰展示了 ExtractSymbolOnly_ByJump 的工作效果
+    cv::circle(show_mat,cv::Point(target_trigger_x,target_trigger_y),4,cv::Scalar(255,0,255),3);
+}
+
+
+void get_pic(void)
+{
+    static int frame_count=0;
+    //获取原始帧
+    if(mid_line_detect()&&frame_count%10==0){
+        cv::Rect found_roi=QuickDetect(target_trigger_x,target_trigger_y,raw_pic);
+        if(found_roi.width>0&&found_roi.height>0){
+            cv::Mat rotated = CropAndPerspective(raw_pic, current_rRect,trigger);
+            if(rotated.empty())
+                return;
+            cout<<trigger<<endl;
+            cv::Mat final_img = RemoveRedBaseSafely(rotated);
+            if(final_img.empty()){
+                return;
+            }
+            lyc_udp.udp_send_image(final_img);
+            //cout<<frame_count<<endl;
+            usleep(2000);
+        }
+    }
+    frame_count++;
+}
+
+vector<Image_Type>vote;    //投票
+bool begin_recognition=false;   //返回给控制端进行减速的标志位
+bool bypass_action_flag=false;  //当trigger到达10时返回给控制端的绕行bool
+
+//辅助函数：统计vector种出现次数最多的目标类型
+Image_Type GetMajorityVote(const vector<Image_Type>& votes)
+{
+    if(votes.empty())
+        return unknown;
+
+    int count_supplies=0;
+    int count_vehicle=0;
+    int count_weapon=0;
+
+    for(const auto&type:votes){
+        if(type==supplies)
+            count_supplies++;
+        else if(type==vehicle)
+            count_vehicle++;
+        else if(type==weapon)
+            count_weapon++;
+    }
+
+    if(count_supplies>=count_vehicle&&count_supplies>=count_weapon&&count_supplies>0)
+        return supplies;
+    if(count_supplies>=count_supplies&&count_vehicle>=count_weapon&&count_vehicle>0)
+        return vehicle;
+    if(count_weapon>=count_supplies&&count_weapon>=count_vehicle&&count_weapon>0)
+        return weapon;
+
+    return unknown;
+}
+
+/*
+void Bypass_Recovery_Line(void)
+{
+    // 初始化左右边界搜索起点
+    int x1=-1,x2=-1;
+    // 动态确定扫描起始高度（核心关键点）
+    // 因为刚绕过障碍物，近处有残影。我们直接利用最长白列的高度 Long_WhiteLine_Y 作为基础，
+    // 把搜索起始行定在障碍物上方、视野干净的远端（例如 Long_WhiteLine_Y 往下放一点点，或者固定在一个安全的远端行）
+    int start=starty-30; 
+    int col_offset=40;
+    // 以最长白列的 X 坐标为绝对核心，向左右两侧寻找黑白跳变点
+    // 这样无论车身怎么歪，只要远端白列抓对了，左右边线就一定能精准抓到
+    for(int row_offset=0;row_offset<30;row_offset+=5){
+        int current_y=start-row_offset;
+        if(current_y<10){
+            break;
+        }
+        //向左找左边缘(x1初始何以设在靠中间偏右一点，或者直接从中心160向左扫)
+        if(x1==-1){
+            for(int i=(IMG_W>>1+col_offset);i>Block_Size;--i){
+                if(AT(i,current_y>=OSTU_threshold&&AT(i-1,current_y)<OSTU_threshold)){
+                    x1=i;
+                    break;
+                }
+            }
+        }
+        //向右找右边缘(x2从中心160向右扫)
+        if(x2==-1){
+            for(int i=(IMG_W>>1-col_offset);i<IMG_W-Block_Size;++i){
+                if(AT(i,current_y)>=OSTU_threshold&&AT(i+1,current_y)<OSTU_threshold){
+                    x2=i;
+                    break;
+                }
+            }
+        }
+        //如果左右至少找到了一条，就可以跳出外层行循环
+        if(x1!=-1||x2!=-1){
+            break;
+        }
+    }
+    
+
+    for(int i=Long_WhiteLine_X;i<IMG_W-Block_Size/2-1;++i){
+        if(AT(i,start)>=OSTU_threshold&&AT(i+1,start)<OSTU_threshold){
+            x2=i; // 右边缘
+            break;
+        }
+    }
+    //
+    // 远端二次爬线与处理
+    Far_Left_Num=Far_Right_Num=0;
+    findline_lefthand_adaptive(x1,start,FarLeft_Line,&Far_Left_Num);//存在黑白跳变，寻找左线
+    findline_righthand_adaptive(x2,start,FarRight_Line,&Far_Right_Num);//存在黑白跳变，寻找右线
+    blur_points(FarLeft_Line,Far_Left_Num,FarBlueLeft_Line);
+    blur_points(FarRight_Line,Far_Right_Num,FarBlueRight_Line);
+    resample_points(FarBlueLeft_Line,Far_Left_Num,FarRepLeft_Line,&FarRepLnum);
+    resample_points(FarBlueRight_Line,Far_Right_Num,FarRepRight_Line,&FarRepRnum);
+    // 路径重建：平移生成远端中线
+    track_leftline(FarRepLeft_Line,0,FarRepLnum,Left_Mid_Line,&L_Mid_Num);
+    track_rightline(FarRepRight_Line,0,FarRepRnum,Right_Mid_Line,&R_Mid_Num);
+    // 择优选择与补线
+    // 如果你知道自己是向右绕过障碍物的，回正时可以适当偏向信任左侧或右侧
+    if(L_Mid_Num>R_Mid_Num) {
+        Cross_Path_Interpolation(Left_Mid_Line,&L_Mid_Num);
+        LRType=MID_Left;
+    } 
+    else{
+        Cross_Path_Interpolation(Right_Mid_Line,&R_Mid_Num);
+        LRType=MID_Right;
+    }
+}*/
+
+void target_detect_deal(void)
+{
+    int detection_result=mid_line_detect();   //尝试检测
+    switch(current_bypass_state){
+        // ------------------------------------------------
+        // 状态0：正常检测与投票阶段
+        // ------------------------------------------------
+        case STATE_IDLE:{
+            bypass_action_flag=false;//默认不触发绕行
+            begin_recognition=false; //避免目标短暂丢失时状态残留
+            if(trigger<45){
+                current_bypass_state=STATE_DECEL_VOTE;
+            }
+            break;
+        }
+        // ------------------------------------------------
+        // 状态1：减速+投票收集阶段(20<=trigger<=45)
+        // ------------------------------------------------     
+        case STATE_DECEL_VOTE:{
+            //在此状态下，拉高减速标志位通知底层控制端减速
+            begin_recognition=true;
+            bypass_action_flag=false;
+
+            //如果车子因为某些原因又退回去了(trigger>45)
+            if(trigger>45){
+                begin_recognition=false;
+                vote.clear();
+                current_bypass_state=STATE_IDLE;
+                break;
+            }
+            //视觉检测与投票收集
+            cv::Rect found_roi=QuickDetect(target_trigger_x,target_trigger_y,raw_pic);
+            if(found_roi.width>0&&found_roi.height>0&&begin_recognition){
+                cv::Mat rotated=CropAndPerspective(raw_pic,current_rRect,trigger);
+                if(!rotated.empty()){
+                    cv::Mat final_img=RemoveRedBaseSafely(rotated);
+                    if(!final_img.empty()){
+                        cv::resize(final_img,last_cropped_img_,cv::Size(96,96));
+                        string result=ncnn_net_.Infer(last_cropped_img_);
+                        Image_Type current_inferred_type=unknown;
+                        if(result=="supplies")
+                            current_inferred_type=supplies;
+                        else if(result=="vehicle")
+                            current_inferred_type=vehicle;
+                        else if(result=="weapon")
+                            current_inferred_type=weapon;
+                        
+                        vote.push_back(current_inferred_type);
+                        cout<<"推理结果： "<<result<<" | 当前投票池大小: "<<vote.size()<<endl;
+                    }
+                }
+            }
+            //当trigger到达20的临界点时，结束投票，进行结算，并跃迁到盲行绕行状态
+            if(trigger<=20){
+                if(!vote.empty()&&vote.size()>8){
+                    current_target=GetMajorityVote(vote);
+                    cout << "【投票结算完成】最终选定目标类型: " << current_target << endl;
+                    vote.clear();
+                    //投票完成，正式进入盲行切出状态
+                    current_bypass_state=STATE_BYPASS_BLIND;
+                }
+                else {
+                    vote.clear();
+                    current_target=unknown;
+                }
+            }
+            break;
+        }
+        // ------------------------------------------------
+        // 状态2：切出与盲行阶段(惯导+最长白列偏航角+动态PID)
+        // ------------------------------------------------
+        case STATE_BYPASS_BLIND:{
+            std::cout<<1<<endl;
+            bypass_action_flag=true;    //触发绕行动作
+            begin_recognition=false;
+
+            //结合最长白列偏航角与 current_target 传入惯导控制函数
+
+            // 当编码器距离积分 或 陀螺仪角度积分达标后，进入视觉软着陆找线
+            if (/* check_blind_distance_reached() */ true) { 
+                current_bypass_state = STATE_VISION_RECOVERY;
+            }
+            break;
+        }
+        // ------------------------------------------------
+        // 状态3：切出与盲行阶段(惯导+最长白列偏航角+动态PID)
+        // ------------------------------------------------
+        case STATE_VISION_RECOVERY: {
+            std::cout<<2<<endl;
+            bypass_action_flag = true;    
+            Find_Line();
+            //基础滤波与重采样
+            blur_points(Left_Line, Left_Num, Blue_Left_Line);
+            blur_points(Right_Line, Right_Num, Blue_Right_Line);
+            resample_points(Blue_Left_Line, Left_Num, Rep_Left_Line, &Rep_Lnum);
+            resample_points(Blue_Right_Line, Right_Num, Rep_Right_Line, &Rep_Rnum);
+            bool flag_of_recover=Rep_Lnum>40||Rep_Rnum>40;
+            //连续多帧稳定计数器
+            static int stable_counter=0;
+            const int required_stable_frames=5;  //连续8帧
+            if(flag_of_recover){
+                stable_counter++;
+            }
+            else{
+                //如果中间有任何一帧拉跨，立刻清零重来，防止误判
+                stable_counter=0;
+            }
+            if(stable_counter<required_stable_frames){
+                if(Rep_Lnum>0)
+                    track_leftline(Rep_Left_Line,0,Rep_Lnum,Left_Mid_Line,&L_Mid_Num);
+                else
+                    L_Mid_Num=0;
+                if(Rep_Rnum>0)
+                    track_rightline(Rep_Right_Line,0,Rep_Rnum,Right_Mid_Line,&R_Mid_Num);
+                else    
+                    R_Mid_Num=0;
+            }
+            // 视觉连续多帧稳定找到主赛道
+            else{
+                //稳定达标之后说明车已经回正
+                local_angel_points(Rep_Left_Line,Rep_Lnum,Left_Angel);
+                local_angel_points(Rep_Right_Line,Rep_Rnum,Right_Angel);
+                nms_angle(Left_Angel,Rep_Lnum,Nms_Left_Angel);
+                nms_angle(Right_Angel,Rep_Rnum,Nms_Right_Angel);
+                find_corners();
+                Speed_Change();
+                //平移建模
+                if(L_Out==LeftP.LP&&LeftP.ID<70)
+                    track_leftline(Rep_Left_Line,0,LeftP.ID,Left_Mid_Line,&L_Mid_Num);
+                else
+                    track_leftline(Rep_Left_Line,0,Rep_Lnum,Left_Mid_Line,&L_Mid_Num);
+                if(L_Out==RightP.LP&&RightP.ID<70)
+                    track_rightline(Rep_Right_Line,0,RightP.ID,Right_Mid_Line,&R_Mid_Num);
+                else
+                    track_rightline(Rep_Right_Line,0,Rep_Rnum,Right_Mid_Line,&R_Mid_Num);
+
+                //最终仲裁，准备交权
+                Track_Choose();
+                //状态正式切回IDLE,结束绕行
+                stable_counter=0;     //清零，为下一次绕行做准备
+                current_target = unknown;
+                bypass_action_flag = false;
+                current_bypass_state = STATE_IDLE; // 一切恢复正常，回到初始闲置态
+            }
+            break;
+        }
+    }
+}
+
+
+/*
+void target_detect_deal(void)
+{
+    bypass_action_flag=false;   //每次进入先默认重置为0
+    begin_recognition=false;    //避免目标短暂丢失时状态残留
+    int detection_result=mid_line_detect();   //尝试检测
+    if(trigger>45){
+        begin_recognition=false;
+    }
+    //cout<<"trigger: "<<trigger<<endl;
+    //投票收集阶段
+    if(trigger>=20&&trigger<=45){
+        cv::Rect found_roi=QuickDetect(target_trigger_x,target_trigger_y,raw_pic);
+        if(found_roi.width>0&&found_roi.height>0){
+            begin_recognition=true;
+            //cout<<"begin_recognition: "<<begin_recognition<<endl;
+            cv::Mat rotated=CropAndPerspective(raw_pic,current_rRect,trigger);
+            if(!rotated.empty()){
+                cv::Mat final_img=RemoveRedBaseSafely(rotated);
+                if(!final_img.empty()){
+                    //VisualizeDetection(show_mat,found_roi,angle,final_img.rows,rotated);
+                    cv::resize(final_img,last_cropped_img_,cv::Size(96,96));
+                    //执行推理结果并将结果压入投票箱
+                    string result=ncnn_net_.Infer(last_cropped_img_);
+                    Image_Type current_inferred_type=unknown;
+                    if(result=="supplies")
+                        current_inferred_type=supplies;
+                    else if(result=="vehicle")
+                        current_inferred_type=vehicle;
+                    else if(result=="weapon")
+                        current_inferred_type=weapon;
+
+                    vote.push_back(current_inferred_type);
+                    cout<<"推理结果: "<<result<<" | 当前投票池大小："<<vote.size()<<endl;
+                }
+            }
+        }
+    }
+
+    //结算与绕行触发阶段：当trigger到达10时对投票箱进行结算
+    if(trigger<=20){
+        if(!vote.empty()){
+            current_target=GetMajorityVote(vote);
+            //cout << "【投票结算完成】最终选定目标类型: " << current_target << endl;
+            //清空投票箱，为下一次识别做准备
+            vote.clear();
+        }
+        else{
+            current_target=unknown;
+        }
+        //触发绕行bool信号返回给控制端
+        bypass_action_flag=true;
+    }
+}
+*/
+
+void track_trapezoid_bypass(float pts_in[][2],int start,int end,float pts_out[][2],int *num,int trigger_)
+{
+    *num=end-start;
+
+    //定义梯形参数
+    int ramp_len=15;    //转向过程长度(梯形斜边)
+    int flat_len=20;    //保持偏移长度(梯形顶边)
+    float max_bypass=30.0f;  //避让偏移量
+
+    for(int i=start;i<end;i++){
+        int safe_trigger=clip(trigger,start+ramp_len,end-1-flat_len-ramp_len);
+        int dist=i-safe_trigger;
+        float offset_val=0.0f;
+
+        if(dist>=-ramp_len&&dist<0){
+            //上升斜坡:由0升高至max
+            offset_val=max_bypass*(float)(dist+ramp_len)/ramp_len;
+        }
+        else if(dist>=0&&dist<flat_len){
+            //平台期：保持最大偏移
+            offset_val=max_bypass;
+        }
+        else if(dist>=flat_len&&dist<flat_len+ramp_len){
+            //下降斜坡
+            offset_val=max_bypass*(1.0f-(float)(dist-flat_len)/ramp_len);
+        }
+        else{
+            offset_val=0.0f;
+        }
+
+        //应用偏移量计算
+        float total_offset=offset_val*img_k;
+        float dx=pts_in[clip(i+APPROX_NUM,0,end-1)][0]-pts_in[clip(i-APPROX_NUM,0,end-1)][0];
+        float dy=pts_in[clip(i+APPROX_NUM,0,end-1)][1]-pts_in[clip(i-APPROX_NUM,0,end-1)][1];
+        float dn=fast_invsqrt(dx*dx+dy*dy);
+        dx*=dn;
+        dy*=dn;
+        if(LRType==MID_Left){
+            pts_out[i-start][0]=pts_in[i][0]-dy*total_offset;
+            pts_out[i-start][1]=pts_in[i][1]+dx*total_offset;
+        }
+        else{
+            pts_out[i-start][0]=pts_in[i][0]+dy*total_offset;
+            pts_out[i-start][1]=pts_in[i][1]-dx*total_offset;
         }
     }
 }

@@ -45,4 +45,5 @@ void Cross_Check(void);
 void Cross_Loop(void);
 float Cross_MidLine_Ctrl(void);
 uint8 Cross_Refind_Line(void);
+void Cross_Path_Interpolation(float (*target_mid_line)[2], int *target_num);
 #endif /*CODE_CROSS_H_*/

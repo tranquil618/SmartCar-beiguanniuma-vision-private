@@ -25,6 +25,7 @@
 #include "Image.h"
 #include "Circle.h"
 #include "Cross.h"
+#include "Recognition.h"
 
 // 在 PC 上调试时，手动定义算法需要的类型，不要引用 inc.h
 #include <cstdint>
@@ -48,7 +49,7 @@ using std::string;
  * @param IMG_H: 图像高度（行数）
  * @param IMG_W: 图像宽度（列数）
 */
-lq_camera_ex cam(IMG_W,IMG_H,90,LQ_CAMERA_0CPU_MJPG);
+lq_camera_ex cam(IMG_W,IMG_H,60,LQ_CAMERA_0CPU_MJPG);
 LQ_NCNN ncnn_net_;
 cv::Mat gray_pic,raw_pic,ipm_pic;
 uint8 Image_Used[IMG_H][IMG_W] __attribute__((aligned(4))) = {{0}};
@@ -62,15 +63,15 @@ int Max_White_Height=0; //最长白列连续高度
 int Standard_Width=240; //赛道在图像底部的像素宽度(用于补线)
 int Block_Size=9;       //局部自适应窗口大小
 int Clip_Value=4;       //经验值(通常4-10)，让阈值稍微比平均亮度黑一点
-float img_k=0.970f;     //逆透视修正系数
-uint8 starty=180;        //搜索的起始y坐标
+float img_k=0.999f;     //逆透视修正系数
+uint8 starty=200;        //搜索的起始y坐标
 uint8 Find_LineNum=20;  //寻找边界的最大行数限制，防止过度所搜导致的误识别，尤其是在环岛状态下
 int Straight_TH=45;     //直线判断阈值，单位为像素，当拟合的直线与实际边界点的平均距离小于该值，则认为边界是直线
 float conf_MAXL=0;      //左边线角点置信度，单位为0-1，越大表示越有可能是角点
 float conf_MAXR=0;      //右边线角点置信度，单位为0-1，越大表示越有可能是角点
-int ANGLE_DIS=20;       //角点之间的最小距离，单位为像素，防止过于密集的角点导致误识别
-int Base_see=27;        //
-int Tsee=27;            //
+int ANGLE_DIS=10;       //角点之间的最小距离，单位为像素，防止过于密集的角点导致误识别
+int Base_see=20;        //
+int Tsee=20;            //
 int Blue_Size=5;        //蓝色路径边界点数量，单位为点
 uint8 CBHBUM=0;         //丢线保护标志，0表示不丢线保护，1表示丢线保护中
 uint8 Base_starty=226;   //丢线保护起始行，单位为像素，通常设置在巡线起始点附近，例如95-110之间，根据实际情况调整
@@ -88,7 +89,6 @@ float straight_SpeedK=0.05f;
 float WhiteLine_SpeedK=0.05f;
 float dist=2.0f;           //
 //图像识别相关
-
 uint8 size=96;                    //图像大小96*96
 bool model_initialized_=false;     //模型初始化标志位
 
@@ -209,8 +209,6 @@ const int dir_frontright[4][2] = {
 
 // 避障决策变量
 float Dynamic_Mid_Offset = MID_DIS; 
-
-extern float error_offset; // 用于存储当前的误差补偿值
 
 
 //辅助函数
@@ -730,12 +728,12 @@ void Find_Line(void)
     int Start=starty;     //搜索的起始行坐标
     int L_find_num,R_find_num;  //纵向深度限制(步长限制),代表最多向上找多少行来确定种子点
     if(Circle_LOut==circle_type)   //如果是环岛，优先使用右边线爬虫，寻找右边线的起点
-        R_find_num=clip(Find_LineNum+80.0,0,Start);  //右环寻找点数限制
+        R_find_num=clip(Find_LineNum+40.0,0,Start);  //右环寻找点数限制
     else   //非环岛，优先使用左边线爬虫，寻找左边先的起点
         R_find_num=Find_LineNum;  //左环寻找点数限制
 
     if(Circle_ROut==circle_type)   //右环，先找到右边界起点
-        L_find_num=clip(Find_LineNum+80.0,0,Start);//左边线寻找点数限制，右环时适当地增加寻找范围，防止起点过于靠近图像底部导致丢线
+        L_find_num=clip(Find_LineNum+40.0,0,Start);//左边线寻找点数限制，右环时适当地增加寻找范围，防止起点过于靠近图像底部导致丢线
     else   //非右环，正常寻找左边线起点
         L_find_num=Find_LineNum;
 
@@ -836,13 +834,12 @@ void Find_Line(void)
         else
             Left_Num=0;  //丢线补线
     }
-
 }
 //=========================================================================
 //寻找赛道边界的角点(环岛入口/出口)
 void find_corners(void)
 {
-#define L_TH (43)    //左边线角点的阈值，单位为mm
+#define L_TH (47)    //左边线角点的阈值，单位为mm
     LeftP.LP=L_NULL,RightP.LP=L_NULL;   //初始化角点状态为未找到
     LeftP.ID=(uint8)Rep_Lnum,RightP.ID=(uint8)Rep_Rnum;
     //标志位，如果Rep_Lnum或Rep_Rnum超过阈值，说明找到了对应的角点
@@ -867,7 +864,7 @@ void find_corners(void)
         //判断角点是否可靠
         if(fabs(conf)>fabs(conf_MAXL))
             conf_MAXL=conf;
-        if(conf>1.05&&conf<2.18f){  //65-115度之间的角点才是合理的
+        if(conf>1.05f&&conf<2.18f){  //65-115度之间的角点才是合理的
             if(Left_Angel[i]>0){   //如果角度是正的，说明是左边线的角点
                 LeftP.LP=L_In;    //设置左边线角点状态为找到
                 LeftP.ID=i;       //记录角点类型
@@ -917,14 +914,14 @@ void find_corners(void)
     RD=residualSum(Rep_Right_Line,Rep_Rnum);
     // 1. 全局平直度纠错：利用最小二乘法残差(LD/RD)判断
     // 即便局部看似有角点(conf_MAX)，但如果整体残差极小(<=1.5)且长度足够，则强制判定为直道，防止噪点干扰
-    if(conf_MAXL<0.600f&&LD<=1.5f&&Rep_Lnum>Straight_TH)
+    if(conf_MAXL<0.1600f&&LD<=1.5f&&Rep_Lnum>Straight_TH)
         is_straightL=1;
-    if(conf_MAXR<0.600f&&RD<=1.5f&&Rep_Rnum>Straight_TH)
+    if(conf_MAXR<0.1600f&&RD<=1.5f&&Rep_Rnum>Straight_TH)
         is_straightR=1;
     //cout<<"LD: "<<LD<<"  RD: "<<RD<<"  Rep_Rnum: "<<Rep_Rnum<<"  Rep_Lnum: "<<Rep_Lnum<<endl; 
-    // 2. 左右间距校验（针对左角点）：
+    // 左右间距校验（针对左角点）：
     // 当右边线很直但左边发现角点时，计算该角点到右线的物理距离dn
-    if(is_straightR&&L_NULL!=LeftP.LP){
+    if((L_NULL==RightP.LP||is_straightR)&&L_NULL!=LeftP.LP){
         float dn=0;
         float dx=Rep_Left_Line[LeftP.ID][0]-Rep_Right_Line[clip(LeftP.ID,0,Rep_Rnum-1)][0];
         float dy=Rep_Left_Line[LeftP.ID][1]-Rep_Right_Line[clip(LeftP.ID,0,Rep_Rnum-1)][1];
@@ -937,9 +934,9 @@ void find_corners(void)
         else
             LRob=0;
     }
-    // 3. 左右间距校验（针对右角点）：
+    // 左右间距校验（针对右角点）：
     // 同理，当左边线很直但右边发现角点时，校验其到左线的距离是否符合赛道物理宽度
-    if(is_straightL&&L_NULL!=RightP.LP){
+    if((L_NULL==LeftP.LP||is_straightL)&&L_NULL!=RightP.LP){
         float dn=0;
         float dx=Rep_Left_Line[clip(RightP.ID,0,Rep_Lnum-1)][0]-Rep_Right_Line[RightP.ID][0];
         float dy=Rep_Left_Line[clip(RightP.ID,0,Rep_Lnum-1)][1]-Rep_Right_Line[RightP.ID][1];
@@ -1006,11 +1003,6 @@ void Track_Choose(void)
         LRType=MID_Right;
         Dynamic_Mid_Offset=MID_DIS;
     }
-    /*
-    if(winner==Image_Type::weapon)   
-        LRType=MID_Left;
-    else if(winner==Image_Type::supplies)
-        LRType=MID_Right;*/
 }
 
 //==================================================================
@@ -1028,7 +1020,7 @@ float MidLine_Ctrl(void)
     
     // 在逆透视图(IPM)中，由于图像已经是对称拉伸的
     // cx 依然建议设为图像宽度的一半（160/2 = 80）
-    float cx = mapx[235][160]+1.239945f-1.32755f; 
+    float cx = mapx[235][160]-10.827305f+11.5407f; 
     float cy = mapy[235][160]+14.0f; // 底部
 
     // 角色绑定（保持不变）
@@ -1090,8 +1082,9 @@ float MidLine_Ctrl(void)
     else {
         last_err1 *= 0.5f; // 丢线衰减
     }
+
     //cout<<last_err1 * 0.7f + last_err2 * 0.2f + last_err3 * 0.1f<<endl;
-    return last_err1 * 0.7f + last_err2 * 0.2f + last_err3 * 0.1f+error_offset;
+    return last_err1 * 0.7f + last_err2 * 0.2f + last_err3 * 0.1f;
 }
 
 //=================================================================
@@ -1193,6 +1186,8 @@ uint8 Long_White(void)
     // 4. 更新全局变量，供其他函数参考
     Long_WhiteLine_X = search_x;
     Long_WhiteLine_Y = y;
+    //cout<<"Long_WhiteLine_X: "<<Long_WhiteLine_X;
+    //cout<<"  Long_WhiteLine_Y: "<<Long_WhiteLine_Y<<endl;
     // 返回值限制在合理高度范围内
     return (uint8)clip(y, 0, IMG_H - 1);
 }
@@ -1523,7 +1518,7 @@ void Img_deal(void)
     //寻找视野当中最远的白点，判定这条路有多长
     get_highest(&Long_WhiteLine_X,&Long_WhiteLine_Y);
     //丢线检查
-    banmaxian_center_scan_stop();
+    //banmaxian_center_scan_stop();
     //Check_Loss();
     //最远点计算，决定当前图像是否有效，如果为全黑，后面所有计算全是浪费计算
     Long_WhiteLine=IMG_H-10-Long_White();  //中心白列长度
@@ -1561,7 +1556,6 @@ void Img_deal(void)
         track_rightline(Rep_Right_Line,0,Rep_Rnum,Right_Mid_Line,&R_Mid_Num);
     //最终仲裁，所有线、角点都找到了，这个函数决定本帧图像时信左线还是右线，
     //抑或是进环岛进行特殊处理
-
     Track_Choose();
 }
 
@@ -1572,7 +1566,7 @@ extern int start_test; // 用于测试的全局变量，记录 start 的值
 #define SERVER_SYD_PORT 8080           // 修改为上位机监听的端口
 lq_udp_client syd_udp(SERVER_SYD_IP, SERVER_SYD_PORT); // 实例化对象
 
-#define SERVER_LYC_IP "192.168.43.36"  // 修改为你电脑的IP地址
+#define SERVER_LYC_IP "192.168.43.40"  // 修改为你电脑的IP地址
 #define SERVER_LYC_PORT 8080           // 修改为上位机监听的端口
 lq_udp_client lyc_udp(SERVER_LYC_IP, SERVER_LYC_PORT); // 实例化对象
 cv::Mat show_mat;
@@ -1593,10 +1587,12 @@ void view(void)
     //cv::line(show_mat,cv::Point(IMG_W/2-60,183),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
     //cv::line(show_mat,cv::Point(IMG_W/2-60,205),cv::Point(IMG_W/2-60,183),cv::Scalar(0,255,255),1);
     //cv::line(show_mat,cv::Point(IMG_W/2+60,205),cv::Point(IMG_W/2+60,183),cv::Scalar(0,255,255),1);
-                
+               
+    //cv::line(show_mat,cv::Point(mapx[205][0],mapy[205][0]),cv::Point(mapx[205][1],mapy[205][1]),cv::Scalar(0,255,255),1);
+    //cv::line(show_mat,cv::Point(mapx[105][0],mapy[105][0]),cv::Point(mapx[105][1],mapy[105][1]),cv::Scalar(0,255,255),1);
+    cv::line(show_mat,cv::Point(mapx[220][160],mapy[220][160]),cv::Point(mapx[Long_WhiteLine_Y][Long_WhiteLine_X],mapy[Long_WhiteLine_Y][Long_WhiteLine_X]),cv::Scalar(0,255,255),1);
     // 5. 绘制边线和中线
     // 5.1 绘制原有的左边线 (蓝色)
-            
     for (int i = 0; i < Rep_Lnum; i++) 
         cv::circle(show_mat, cv::Point((int)Rep_Left_Line[i][0], (int)Rep_Left_Line[i][1]), 1, cv::Scalar(255, 0, 0), -1);
     // 5.2 绘制原有的右边线 (绿色)
@@ -1608,7 +1604,7 @@ void view(void)
     // 5.2 绘制远端的右边线 (黄色)
     for (int i = 0; i < Far_Right_Num; i++) 
         cv::circle(show_mat, cv::Point((int)FarRight_Line[i][0], (int)FarRight_Line[i][1]), 1, cv::Scalar(0, 255, 255), -1);
-    // 5.3 绘制中线 (紫色)
+    // 
     for(int i=0;i<(L_Mid_Num);i++){
         cv::circle(show_mat,cv::Point((int)Left_Mid_Line[i][0],(int)Left_Mid_Line[i][1]),1,cv::Scalar(0, 0, 255),-1);
     }
@@ -1618,356 +1614,27 @@ void view(void)
     }
     //中线(紫色)
     for(int i=0;i<(*MidnumPts);i++){
+        if(i==10){
+            cv::circle(show_mat,cv::Point((int)mid_pts[i][0],(int)mid_pts[i][1]),1,cv::Scalar(0,255,0),-1,-1);
+            continue;
+        }
+        if(i==30){
+            cv::circle(show_mat,cv::Point((int)mid_pts[i][0],(int)mid_pts[i][1]),1,cv::Scalar(0,255,0),-1,-1);
+            continue;
+        }
         cv::circle(show_mat,cv::Point((int)mid_pts[i][0],(int)mid_pts[i][1]),1,cv::Scalar(255, 0, 255),-1,-1);
     }
+    float dx=fabs(mid_pts[10][0]-mid_pts[30][0]);
+    float dy=fabs(mid_pts[10][1]-mid_pts[30][1]);
+    float dist=fast_sqrt(dx*dx+dy*dy);
+    
+    /*
+    for(int i=0;i<(*MidnumPts);i++){
+        cv::circle(show_mat,cv::Point(mapx[(int)mid_pts[i][1]][(int)mid_pts[i][0]],mapy[(int)mid_pts[i][1]][(int)mid_pts[i][0]]),1,cv::Scalar(255, 0, 255),-1,-1);
+    }*/
+    //cv::circle(show_mat,cv::Point(mid_pts[Tsee][0],mid_pts[Tsee][1]),5,cv::Scalar(0,255,0),-1);
+    //cv::circle(show_mat,cv::Point(mapx[235][160]-10.827305f,mapy[235][160]+14.0f),5,cv::Scalar(0,255,0),-1);
     //target_detect_deal();
     // --- 6. 发送显示 ---
     lyc_udp.udp_send_image(show_mat, 80);
-}
-
-//=================================================================
-
-//目标识别部分
-//记录黑白跳变发生的位置
-int target_trigger_y=-1;
-int target_trigger_x=-1;
-
-cv::Mat hsv_img;   //HSV图像
-cv::Mat red_mask;  //红色mask
-cv::Mat target_crop;//裁剪结果
-
-bool target_detect_flag=false;   //当前是否进入目标检测流程
-//检测当前状态
-enum TargetState{
-    NO_TARGET,
-    CHECK_RED,
-    CLASSFY
-};
-TargetState target_state=NO_TARGET;
-//NCNN结果举例
-enum Image_Type{
-    unknown,
-    supplies,
-    vehicle,
-    weapon
-};
-Image_Type current_target=unknown;
-
-//切线斜率
-
-float angle;
-int trigger=-1;
-int mid_line_detect(void)
-{  
-    static int x_last=0,y_last=0;
-    static int x_last_1=0,y_last_1=0;
-    switch(LRType){
-        case MID_Left:  
-            Center_Line = Left_Mid_Line;  
-            Center_Line_Num = &L_Mid_Num;
-            break;
-        case MID_Right:
-            Center_Line = Right_Mid_Line;
-            Center_Line_Num = &R_Mid_Num;
-            break;
-        case MID_Ramp:  
-            Center_Line = RampMID;
-            Center_Line_Num = &RampMIDNum;
-            break;
-        default:
-            break;
-    }
-    if(*Center_Line_Num<5){
-        return -1;
-    }
-    for(int i=5;i<*Center_Line_Num;i++){
-        int x=mapx[(int)Center_Line[i][1]][(int)Center_Line[i][0]];
-        int y=mapy[(int)Center_Line[i][1]][(int)Center_Line[i][0]];
-
-        if(AT(x,y)>OSTU_threshold){
-            x_last_1=x_last;
-            y_last_1=y_last;
-            x_last=x;
-            y_last=y;
-            continue;
-        }
-
-        if(AT(x,y)<OSTU_threshold&&AT(x_last,y_last)>OSTU_threshold&&AT(x_last_1,y_last_1)>OSTU_threshold){
-            target_trigger_x=x;
-            target_trigger_y=y;
-            trigger=i;
-            //cout<<trigger<<endl;
-            //cout<<"target_trigger_y:  "<<target_trigger_y<<"Center_Line_Num"<<*Center_Line_Num<<endl;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-//初始化红色HSV阈值
-const cv::Scalar lower_red1_ = cv::Scalar(0, 70, 45);
-const cv::Scalar upper_red1_ = cv::Scalar(10, 255, 255);
-const cv::Scalar lower_red2_ = cv::Scalar(170, 70, 45);
-const cv::Scalar upper_red2_ = cv::Scalar(180, 255, 255);
-
-// 初始化白色赛道 HSV 阈值
-const cv::Scalar lower_white_ = cv::Scalar(0, 0, 160);
-const cv::Scalar upper_white_ = cv::Scalar(180, 35, 255);
-cv::Mat mask1_, mask2_, red_mask_, last_cropped_img_;
-
-//专门提取红块掩码
-void get_red_mask(cv::Mat&hsv_input,cv::Mat& output_mask)
-{
-    //提取红色的第一个色段
-    cv::inRange(hsv_input,lower_red1_,upper_red1_,mask1_);
-    //提取红色的第二个色段
-    cv::inRange(hsv_input,lower_red2_,upper_red2_,mask2_);
-    //将两个掩码进行逻辑或运算，合并成一个完整的红色区域图
-    cv::bitwise_or(mask1_,mask2_,output_mask);
-}
-
-cv::RotatedRect current_rRect;
-cv::RotatedRect final_refind_rRect;
-float zoom=0.25f;
-cv::Rect QuickDetect(int center_x,int center_y,const cv::Mat&hsv_img)
-{
-    //算切向角
-    int y_idx=trigger;
-    //取目标点上下附近的点来求导，计算赛道切线方向
-    int y_upper=std::max(10,std::min(y_idx+20,*Center_Line_Num-1));
-    int y_lower=std::max(10,std::min(y_idx,*Center_Line_Num-1));
-    //dx，dy是切线的偏移量，atan2计算弧度，乘上RAD_TO_DEG转为角度
-    float dx=Center_Line[y_upper][0]-Center_Line[y_lower][0];
-    float dy=Center_Line[y_upper][1]-Center_Line[y_lower][1];
-    //cout<<dx<<"    "<<dy<<endl;
-    float rad=atan2(dy,dx);
-    angle=rad*RAD_TO_DEG;
-    
-    cv::Size2f rSize(55.0f-zoom*y_idx, 45.0f-zoom*y_idx); 
-    
-    // 2. 创建 RotatedRect，注意：此时 center 是中心点
-    // 如果 trigger 是底边中点，那么中心点需要向上平移 height/2
-    float height = rSize.height;
-    float center_offset_x = (height / 2.0f) * cos(rad);
-    float center_offset_y = -(height / 2.0f) * sin(rad);
-    
-    cv::Point2f center_point(center_x + center_offset_x, center_y - center_offset_y);
-    current_rRect = cv::RotatedRect(center_point, rSize, angle);
-
-    // 3. 利用 boundingRect 获得绝对安全的轴对齐矩形 (不会掉信息！)
-    cv::Rect safe_roi = current_rRect.boundingRect();
-    
-    // 4. 修正边界，防止越界
-    safe_roi &= cv::Rect(0, 0, hsv_img.cols, hsv_img.rows);
-
-    // 5. 裁剪并验证
-    cv::Mat hocal_bgr=hsv_img(safe_roi);
-    cv::Mat local_hsv;
-    cv::cvtColor(hocal_bgr,local_hsv,cv::COLOR_BGR2HSV);
-    cv::Mat local_mask;
-    get_red_mask(local_hsv, local_mask);
-    
-    int red_pixels = cv::countNonZero(local_mask);
-    int total_pixels = local_mask.rows * local_mask.cols;
-    
-    if(total_pixels > 0 && (float)red_pixels > total_pixels * 0.05 && (float)red_pixels < total_pixels * 0.85){
-        return safe_roi;
-    }
-    return cv::Rect(0,0,0,0);
-}
-
-cv::Mat CropAndPerspective(const cv::Mat& src, cv::RotatedRect rRect)
-{
-    // 1. 获取 RotatedRect 的四个顶点（这是最真实的物理边框）
-    cv::Point2f src_pts[4];
-    rRect.points(src_pts);
-
-    // 2. 定义目标矩形的四个顶点（即“拉正”后的样子）
-    // 宽度和高度取 rRect 的长宽
-    float w = rRect.size.width;
-    float h = rRect.size.height;
-    cv::Point2f dst_pts[4] = {   
-        cv::Point2f(h, w),     // 右下
-        cv::Point2f(0, w),    // 左下        
-        cv::Point2f(0, 0),    // 左上
-        cv::Point2f(h, 0)    // 右上
-    };
-
-    // 3. 计算透视变换矩阵
-    cv::Mat trans_mat = cv::getPerspectiveTransform(src_pts, dst_pts);
-
-    // 4. 执行透视变换
-    cv::Mat rotated_crop;
-    cv::warpPerspective(src, rotated_crop, trans_mat, cv::Size((int)w, (int)h), cv::INTER_LINEAR);
-
-    return rotated_crop;
-}
-
-//图片旋转
-cv::Mat CropAndRotate(const cv::Mat&src,cv::Rect roi,float angle)
-{
-    //从原图中切出ROI区域
-    cv::Mat crop=src(roi);
-    //以切出的矩形中心为旋转基准点
-    cv::Point2f center(crop.cols/2.0f,crop.rows/2.0f);
-    //根据计算出来的angle获取仿射变换矩阵
-    //1.0f是缩放比例，即保持原大小不变
-    cv::Mat rot_mat=cv::getRotationMatrix2D(center,(90.0+angle),1.0f);
-    //执行旋转变换
-    //INTER_LINEAR(双线性插值)是性能与效果的最佳平衡点
-    cv::Mat rotated_crop;
-    cv::warpAffine(crop,rotated_crop,rot_mat,crop.size(),cv::INTER_LINEAR,cv::BORDER_REPLICATE);
-    //返回摆正后的局部图像
-    return rotated_crop;
-}
-
-//进行裁剪
-cv::Mat ExtractSymbolOnly_ByJump(const cv::Mat& rotated_crop)
-{
-    cv::Mat hsv_roi, symbol_mask;
-    cv::cvtColor(rotated_crop, hsv_roi, cv::COLOR_BGR2HSV);
-    get_red_mask(hsv_roi, symbol_mask);
-
-    // 1. 先进行一次形态学开运算 (Opening)，去掉中间连接的细小噪声
-    // 这样红块之间如果没有物理接触，就会彻底断开
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::morphologyEx(symbol_mask, symbol_mask, cv::MORPH_OPEN, kernel);
-
-    vector<int> row_counts(symbol_mask.rows);
-    for(int i = 0; i < symbol_mask.rows; ++i){
-        row_counts[i] = cv::countNonZero(symbol_mask.row(i));
-    }
-
-    // 2. 寻找“分界线”
-    // 我们从中间向上找，找到第一个 row_counts 为 0 或极小的值
-    // 这代表基座和标志之间的“空隙”
-    int bottom_edge = symbol_mask.rows;
-    for(int i = symbol_mask.rows - 1; i > symbol_mask.rows / 2; --i) {
-        // 如果该行红点数很少，说明这里是两个块之间的空隙
-        if(row_counts[i] < (symbol_mask.cols * 0.05)){ // 阈值设为列宽的5%
-            bottom_edge = i;
-            break;
-        }
-    }
-
-    // 如果没找到明显的空隙，则保留原图 (为了安全)
-    if (bottom_edge == symbol_mask.rows) bottom_edge = symbol_mask.rows;
-
-    cv::Rect symbol_rect(0, 0, symbol_mask.cols, bottom_edge);
-    symbol_rect &= cv::Rect(0, 0, rotated_crop.cols, rotated_crop.rows);
-    
-    return rotated_crop(symbol_rect);
-}
-
-void getTargetType(const cv::Mat&cropped_img)
-{
-    if(cropped_img.empty()||!model_initialized_){
-        return;
-    }
-    string result=ncnn_net_.Infer(cropped_img);
-    if(result=="supplies")
-        current_target=supplies;
-    else if(result=="vehicle")
-        current_target=vehicle;
-    else if(result=="weapon")
-        current_target=weapon;
-    else
-        current_target=unknown;
-    cout<<"推理结果："<<result<<endl; 
-}
-
-void track_trapezoid_bypass(float pts_in[][2],int start,int end,float pts_out[][2],int *num,int trigger_)
-{
-    *num=end-start;
-
-    //定义梯形参数
-    int ramp_len=15;    //转向过程长度(梯形斜边)
-    int flat_len=20;    //保持偏移长度(梯形顶边)
-    float max_bypass=30.0f;  //避让偏移量
-
-    for(int i=start;i<end;i++){
-        int safe_trigger=clip(trigger,start+ramp_len,end-1-flat_len-ramp_len);
-        int dist=i-safe_trigger;
-        float offset_val=0.0f;
-
-        if(dist>=-ramp_len&&dist<0){
-            //上升斜坡:由0升高至max
-            offset_val=max_bypass*(float)(dist+ramp_len)/ramp_len;
-        }
-        else if(dist>=0&&dist<flat_len){
-            //平台期：保持最大偏移
-            offset_val=max_bypass;
-        }
-        else if(dist>=flat_len&&dist<flat_len+ramp_len){
-            //下降斜坡
-            offset_val=max_bypass*(1.0f-(float)(dist-flat_len)/ramp_len);
-        }
-        else{
-            offset_val=0.0f;
-        }
-
-        //应用偏移量计算
-        float total_offset=offset_val*img_k;
-        float dx=pts_in[clip(i+APPROX_NUM,0,end-1)][0]-pts_in[clip(i-APPROX_NUM,0,end-1)][0];
-        float dy=pts_in[clip(i+APPROX_NUM,0,end-1)][1]-pts_in[clip(i-APPROX_NUM,0,end-1)][1];
-        float dn=fast_invsqrt(dx*dx+dy*dy);
-        dx*=dn;
-        dy*=dn;
-        if(LRType==MID_Left){
-            pts_out[i-start][0]=pts_in[i][0]-dy*total_offset;
-            pts_out[i-start][1]=pts_in[i][1]+dx*total_offset;
-        }
-        else{
-            pts_out[i-start][0]=pts_in[i][0]+dy*total_offset;
-            pts_out[i-start][1]=pts_in[i][1]-dx*total_offset;
-        }
-    }
-}
-
-/**
- * @param img           要绘制的底图 (建议传 raw_pic)
- * @param roi           QuickDetect 得到的原始矩形
- * @param angle         切线角
- * @param bottom_edge   ExtractSymbolOnly_ByJump 得到的截断位置 (相对坐标)
- * @param rotated_img   ExtractSymbolOnly_ByJump 之后的那张摆正后的图 (用于画局部截断线)
- */
-void VisualizeDetection(cv::Mat& img, cv::Rect roi, float angle, int bottom_edge, cv::Mat& rotated_img)
-{
-    // 直接获取 RotatedRect 的四个顶点
-    cv::Point2f vertices[4];
-    current_rRect.points(vertices);
-    
-    // 绘制绿色的斜框
-    for (int i = 0; i < 4; i++) {
-        cv::line(img, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
-        cv::circle(img, vertices[i], 5, cv::Scalar(0, 0, 255), -1);
-    }
-
-    // --- 第二部分：在摆正后的局部图中绘制红色截断线 ---
-    // 这行线清晰展示了 ExtractSymbolOnly_ByJump 的工作效果
-    cv::circle(show_mat,cv::Point(target_trigger_x,target_trigger_y),4,cv::Scalar(255,0,255),3);
-}
-
-void target_detect_deal(void)
-{
-    if(mid_line_detect()==1){
-        cv::Rect found_roi = QuickDetect(target_trigger_x, target_trigger_y, raw_pic);
-        //cout<<angle<<endl;
-        if(found_roi.width > 0){
-            cv::Mat rotated = CropAndPerspective(raw_pic, current_rRect);
-            cv::Mat final_img = ExtractSymbolOnly_ByJump(rotated);
-            cv::resize(final_img,last_cropped_img_,cv::Size(96,96));
-            getTargetType(last_cropped_img_);
-
-            if(LRType==MID_Left)
-                track_trapezoid_bypass(Left_Mid_Line,0,L_Mid_Num,Left_Mid_Line,&L_Mid_Num,trigger);
-            else    
-                track_trapezoid_bypass(Right_Mid_Line,0,R_Mid_Num,Right_Mid_Line,&R_Mid_Num,trigger);
-            // 一目了然：绿框是搜索范围，红线是截断位置，红点是角点
-            //lyc_udp.udp_send_image(final_img, 80);
-            //VisualizeDetection(show_mat, found_roi, angle,final_img.rows,rotated);
-            
-            // ... 喂给模型 ...
-        }
-    }
 }

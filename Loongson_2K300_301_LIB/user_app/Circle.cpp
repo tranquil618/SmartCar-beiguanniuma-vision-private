@@ -12,7 +12,7 @@ static float Check_yaw=0;
 //视觉检测到圆环特征(如L型拐点)时不立刻切换状态，而是连续3帧图像都看到这个特征
 uint8 Circle_fps_th=3;
 //入环阶段的角度阈值，当小车正在入环时，它需要一直保持入环的特殊控制，知道陀螺仪显示小车已经转过了60度
-float Circle_IN_yaw=120.0f;
+float Circle_IN_yaw=60.0f;
 //只有当Cyaw超过160度之后，程序才允许Circle_Check去寻找出环的特征点
 float Circle_Out_yaw=160.0f;
 
@@ -57,13 +57,13 @@ void Circle_Loop(void)
         //左入环阶段
         case Circle_LIN:
             //确认爬虫已经抓到了线(Rep_Lnum>0)
-            if(Lflag==0&&Rep_Lnum<=10)
+            if(Lflag==0&&Rep_Lnum<5)
                 Lflag=1;
             //LRType=MID_Right;//强制锁定右单边巡线，忽略乱掉的左边
             //状态跳转条件：
             //当左边爬到的点数足够多(>20),且拐点消失了(L_NULL==LeftP.LP),
             //并且左边线不再是直的(!is_straightL),说明车身已经进入圆弧
-            if(Lflag&&(Rep_Lnum>45&&L_NULL==LeftP.LP&&!is_straightL)){
+            if(Lflag&&(Rep_Lnum>35&&L_NULL==LeftP.LP&&!is_straightL)){
                 Lflag=0;    //清除标志状态位供下次使用
                 circle_type=Circle_L;  //正式进入环内状态
                 Cyaw=yaw_angle;    //再次校准陀螺仪角度锚点
@@ -72,13 +72,13 @@ void Circle_Loop(void)
         //右入环阶段
         case Circle_RIN:
             //确认爬虫已经抓到了线(Rep_Rnum>0)
-            if(Rflag==0&&Rep_Rnum<=10)
+            if(Rflag==0&&Rep_Rnum<5)
                 Rflag=1;
             //LRType=MID_Left;//强制锁定左单边巡线，忽略乱掉的右边
             //状态跳转条件：
             //当右边爬到的点数足够多(>20),且拐点消失了(L_NULL==LeftP.LP),
             //并且左边线不再是值得(!is_straightR),说明车身已经进入圆弧
-            if(Rflag&&(Rep_Rnum>45&&L_NULL==RightP.LP&&!is_straightR)){
+            if(Rflag&&(Rep_Rnum>35&&L_NULL==RightP.LP&&!is_straightR)){
                 Rflag=0;   //清楚标志状态位供下次使用
                 circle_type=Circle_R;  //正式进入环内状态
                 Cyaw=yaw_angle;   //再次校准陀螺仪角度锚点
@@ -131,9 +131,9 @@ void Circle_Loop(void)
             //寻找出环的角点特征
             if(0==L_out_flag&&L_NULL!=RightP.LP&&RightP.ID<20)
                 L_out_flag=1;
-            LRType=MID_Left;  //暂时还是贴着左边跑
+            //LRType=MID_Left;  //暂时还是贴着左边跑
             if(L_out_flag){
-                //LRType=MID_Left;
+                LRType=MID_Left;
                 //寻找环外的直到(回归信号)
                 if(is_straightR){
                     LRType=MID_Right;  //看到右边有直道，尝试切换
@@ -155,9 +155,9 @@ void Circle_Loop(void)
             if(R_out_flag==0&&L_NULL!=LeftP.LP&&LeftP.ID<20)
                 R_out_flag=1;
             
-            LRType=MID_Right; //暂时还是贴着右边跑
+            //LRType=MID_Right; //暂时还是贴着右边跑
             if(R_out_flag){
-                //LRType=MID_Right;
+                LRType=MID_Right;
                 //寻找环外的直到(回归信号)
                 if(is_straightL){
                     LRType=MID_Left; //看到右边有直道，尝试切换

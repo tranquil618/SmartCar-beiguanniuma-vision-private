@@ -17,7 +17,7 @@ typedef uint8_t uint8;
 #define IMG_H 240        //高240
 #define MAX_POINTS 160   //最大搜索点量
 #define APPROX_NUM 10   //切线拟合距离
-#define MID_DIS    22.5f//中线平移距离
+#define MID_DIS    30.0f//中线平移距离
 #define RAD_TO_DEG 57.29578f
 //有关图像边界的宏定义
 
@@ -202,8 +202,4 @@ int Img_Copy(void);
 //可视化
 void view(void);
 
-//目标板
-int mid_line_detect(void);
-
-void target_detect_deal(void);
 #endif // VISION_H

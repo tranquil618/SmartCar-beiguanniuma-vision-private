@@ -381,7 +381,7 @@ uint8 Cross_Refind_Line(void)
     int x1=160,x2=160;
     //动态确定扫描起始高度
     int start=IMG_H/4*3;
-    int dynamic_offset=75;
+    int dynamic_offset=85;
     //如果左右都有特殊状态
     if(L_NULL!=RightP.LP&&L_NULL!=LeftP.LP){
         //如果右边找到的位置比左边高，取角点坐标
@@ -404,7 +404,7 @@ uint8 Cross_Refind_Line(void)
     }
     //其他的话就直接取(94,65)的坐标作为start起始坐标
     else{    
-        start=60;
+        start=80;
     //    cout<<"type:  "<<4<<endl;
     }
     
@@ -424,7 +424,19 @@ uint8 Cross_Refind_Line(void)
             break;
         }
     }
-
+    if(x1<80){
+        x1=165;
+    }
+    else if(x1>165){
+        x1=155;
+    }
+    if(x2>260){
+        x2=150;
+    }
+    else if(x2<160){
+        x2=170;
+    }
+    //cout<<"x1: "<<x1<<"  x2: "<<x2<<endl;
     start_global=start;
     //远端二次爬线与处理
     //八邻域+三角滤波+重采样插值
